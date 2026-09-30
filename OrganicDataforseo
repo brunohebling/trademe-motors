@@ -1,0 +1,414 @@
+/**
+ * ORGANIC RANKINGS - BATCHED, AUTOMATED VERSION
+ *
+ * - Core engine: fetchOrganicBatch(startRow, endRow, clearSheet)
+ * - Config for batch ranges
+ * - Automation via time-based triggers
+ *
+ * HOW TO USE:
+ * 1. Put your DataForSEO login/password in authHeader_().
+ * 2. Make sure you have a "Final keywords" sheet with keywords in column A.
+ * 3. Run startOrganicAutomation() once to begin.
+ */
+
+// ==========================================================
+// CONFIG FOR ORGANIC AUTOMATION
+// ==========================================================
+
+// 290-keyword batches
+var ORGANIC_BATCH_CONFIG = [
+  { start: 2,    end: 101 },
+  { start: 102,  end: 201 },
+  { start: 202,  end: 301 },
+  { start: 302,  end: 401 },
+  { start: 402,  end: 501 },
+  { start: 502,  end: 601 },
+  { start: 602,  end: 701 },
+  { start: 702,  end: 801 },
+  { start: 802,  end: 901 },
+  { start: 902,  end: 1001 },
+  { start: 1002, end: 1101 },
+  { start: 1102, end: 1201 },
+  { start: 1202, end: 1301 },
+  { start: 1302, end: 1401 },
+  { start: 1402, end: 1501 },
+  { start: 1502, end: 1601 },
+  { start: 1602, end: 1701 },
+  { start: 1702, end: 1801 },
+  { start: 1802, end: 1901 },
+  { start: 1902, end: 2001 },
+  { start: 2002, end: 2101 },
+  { start: 2102, end: 2201 },
+  { start: 2202, end: 2301 },
+  { start: 2302, end: 2401 },
+  { start: 2402, end: 2501 },
+  { start: 2502, end: 2601 },
+  { start: 2602, end: 2611 }
+];
+
+// Trigger handler function name
+var ORGANIC_TRIGGER_HANDLER = 'runOrganicAutomation';
+
+
+// ==========================================================
+// CORE ENGINE: FETCH ORGANIC FOR A RANGE
+// ==========================================================
+
+/**
+ * Main organic rankings function with batching and lock protection
+ */
+function fetchOrganicBatch(startRow, endRow, clearSheet) {
+/* ─── config ────────────────────────────────────────── */
+// LOCATION and LANGUAGE_CODE come from config.gs
+const DELAY_MS = 1500;  // 2 seconds between each keyword
+const ORG_URL  = 'https://api.dataforseo.com/v3/serp/google/organic/live/advanced';
+/* ───────────────────────────────────────────────────── */
+
+  const ss = SpreadsheetApp.getActive();
+  if (!ss) {
+    console.error('No active spreadsheet found');
+    return;
+  }
+  
+  const kwSheet  = getOrCreateSheet_(ss, 'Final keywords');
+  const orgSheet = getOrCreateSheet_(ss, 'Organic');
+  
+  if (!kwSheet || !orgSheet) {
+    console.error('Could not create/access required sheets');
+    return;
+  }
+
+  // Check if we have enough keywords in the input sheet
+  const lastInputRow = kwSheet.getLastRow();
+  console.log(`Keywords sheet has ${lastInputRow} rows (including header)`);
+  
+  if (lastInputRow < 2) {
+    console.error('No keywords found in "Final keywords" sheet. Please add keywords starting from row 2.');
+    return;
+  }
+  
+  if (startRow > lastInputRow) {
+    console.log(`Start row ${startRow} exceeds available data (${lastInputRow}). Skipping.`);
+    return;
+  }
+
+  // Adjust endRow if it exceeds available data
+  const actualEndRow = Math.min(endRow, lastInputRow);
+  const numRows = actualEndRow - startRow + 1;
+
+  console.log(`Processing range: startRow=${startRow}, endRow=${endRow}, actualEndRow=${actualEndRow}, numRows=${numRows}`);
+
+  if (numRows <= 0) {
+    console.log(`No keywords to process in range ${startRow}-${endRow}`);
+    return;
+  }
+
+  // Initialize headers and clear if first batch
+ if (clearSheet) {
+  try {
+    initializeSheet_(orgSheet, ['Keyword', 'Position', 'URL', 'Timestamp', 'Source']);
+
+    const lastRow = orgSheet.getLastRow();
+    if (lastRow > 1) {
+      const rowsToClear = lastRow - 1;
+      orgSheet.getRange(2, 1, rowsToClear, 5).clearContent();
+      console.log(`Cleared ${rowsToClear} existing organic rows`);
+    }
+  } catch (e) {
+    console.error('Error clearing organic sheet: ' + e);
+    return;
+  }
+}
+
+  // Get keywords for this specific range
+  let keywords = [];
+  try {
+    keywords = kwSheet
+      .getRange(startRow, 1, numRows, 1)
+      .getValues()
+      .map(r => String(r[0] || '').trim())
+      .filter(Boolean);
+  } catch (e) {
+    console.error(`Error reading keywords from range ${startRow}:${actualEndRow}: ${e.message}`);
+    return;
+  }
+
+  if (keywords.length === 0) {
+    console.log(`No valid keywords found in range ${startRow}-${actualEndRow}`);
+    return;
+  }
+
+  const ts = runTimestamp_();
+  const startTime = new Date();
+  console.log(`Organic batch started (rows ${startRow}-${actualEndRow}): ${startTime.toISOString()}`);
+  console.log(`Processing ${keywords.length} keywords with ${DELAY_MS}ms delay between requests`);
+
+  // Auth header + content type
+  const auth = authHeader_();
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, auth);
+
+  const rows = [];
+  const batchLabel = `Keywords-${startRow}-${actualEndRow}`;
+
+  keywords.forEach((kw, index) => {
+    const payload = [{
+      keyword       : kw,
+      location_name : LOCATION,
+      language_code : LANGUAGE_CODE,
+      device        : 'desktop',
+      se_domain     : 'google.co.nz',
+      depth         : 3,
+      priority      : 2
+    }];
+
+    let items = [];
+    try {
+      const resp = UrlFetchApp.fetch(ORG_URL, {
+        method             : 'post',
+        muteHttpExceptions : true,
+        headers            : headers,
+        payload            : JSON.stringify(payload)
+      });
+
+      const code = resp.getResponseCode();
+      if (code >= 200 && code < 300) {
+        const j  = JSON.parse(resp.getContentText() || '{}');
+        const t0 = (j.tasks && j.tasks[0]) ? j.tasks[0] : null;
+        const r0 = (t0 && t0.result && t0.result[0]) ? t0.result[0] : null;
+        items    = (r0 && Array.isArray(r0.items)) ? r0.items : [];
+      } else {
+        rows.push([kw, `ERR(${code})`, '', ts, batchLabel]);
+        console.error(`HTTP ${code} for "${kw}"`);
+      }
+    } catch (e) {
+      rows.push([kw, 'ERR', '', ts, batchLabel]);
+      console.error(`Fetch error for "${kw}": ${e && e.message ? e.message : e}`);
+    }
+
+    // Up to 10 organic items per keyword
+    let added = 0;
+    for (const it of items) {
+      if (it && it.type === 'organic' && added < 10) {
+        rows.push([kw, it.rank_absolute, it.url || '', ts, batchLabel]);
+        added++;
+      }
+    }
+    if (added === 0) {
+      rows.push([kw, '–', '', ts, batchLabel]);
+    }
+
+    // Rate limiting: delay between requests (skip on last keyword)
+    if (index < keywords.length - 1) {
+      Utilities.sleep(DELAY_MS);
+    }
+  });
+
+  // Use lock when appending data
+if (rows.length) {
+  try {
+    const writeRow = Math.max(orgSheet.getLastRow() + 1, 2);
+    orgSheet.getRange(writeRow, 1, rows.length, 5).setValues(rows);
+  } catch (e) {
+    console.error('Error writing organic rows: ' + e);
+    return;
+  }
+}
+
+  const endTime = new Date();
+  const duration = (endTime - startTime) / 1000;
+  console.log(`Organic batch completed (rows ${startRow}-${actualEndRow}): ${endTime.toISOString()} | rows written: ${rows.length} | duration: ${duration}s`);
+}
+
+
+// ==========================================================
+// OPTIONAL MANUAL ENTRY POINTS (still usable)
+// ==========================================================
+
+function fetchOrganic1() { fetchOrganicBatch(2, 291,  true); }
+function fetchOrganic2() { fetchOrganicBatch(292, 581, false); }
+function fetchOrganic3() { fetchOrganicBatch(582, 871, false); }
+function fetchOrganic4() { fetchOrganicBatch(872, 1161, false); }
+function fetchOrganic5() { fetchOrganicBatch(1162, 1451, false); }
+function fetchOrganic6() { fetchOrganicBatch(1452, 1741, false); }
+function fetchOrganic7() { fetchOrganicBatch(1742, 2031, false); }
+function fetchOrganic8() { fetchOrganicBatch(2032, 2321, false); }
+function fetchOrganic9() { fetchOrganicBatch(2322, 2611, false); }
+
+
+// ==========================================================
+// AUTOMATION: BATCH ORCHESTRATION FOR ORGANIC
+// ==========================================================
+
+function startOrganicAutomation() {
+  const props = PropertiesService.getScriptProperties();
+
+  const triggers = ScriptApp.getProjectTriggers().filter(function (t) {
+    return t.getHandlerFunction() === ORGANIC_TRIGGER_HANDLER;
+  });
+
+  const runningFlag = props.getProperty('organicRunning') === 'true';
+
+  // case 1: flag + trigger → genuinely running
+  if (runningFlag && triggers.length > 0) {
+    Logger.log('Organic automation already running (flag + trigger present).');
+    return;
+  }
+
+  // case 2: flag true but no trigger → stale
+  if (runningFlag && triggers.length === 0) {
+    Logger.log('Stale organic automation state (flag=true, no trigger). Resetting.');
+    props.setProperty('organicRunning', 'false');
+  }
+
+  props.setProperty('organicRunning', 'true');
+  props.setProperty('organicBatchIndex', '0');
+  props.setProperty('organicStartTime', new Date().toISOString());
+
+  deleteOrganicTriggers();
+
+  Logger.log('Starting organic automation (9 batches).');
+
+  ScriptApp.newTrigger(ORGANIC_TRIGGER_HANDLER)
+    .timeBased()
+    .after(60 * 1000)  // start in 1 minute
+    .create();
+}
+
+
+function runOrganicAutomation() {
+  const props = PropertiesService.getScriptProperties();
+
+  if (props.getProperty('organicRunning') !== 'true') {
+    Logger.log('Organic automation flag off. Stopping and clearing triggers.');
+    deleteOrganicTriggers();
+    return;
+  }
+
+  const batches = ORGANIC_BATCH_CONFIG;
+  let batchIndex = parseInt(props.getProperty('organicBatchIndex') || '0', 10);
+
+  if (!batches || batchIndex >= batches.length) {
+    Logger.log('All organic batches complete.');
+    props.setProperty('organicRunning', 'false');
+    props.setProperty('organicCompletedAt', new Date().toISOString());
+    deleteOrganicTriggers();
+    return;
+  }
+
+  const batch = batches[batchIndex];
+  Logger.log(
+    'Running ORGANIC batch ' +
+    (batchIndex + 1) +
+    '/' + batches.length +
+    ' (rows ' + batch.start + '-' + batch.end + ')'
+  );
+
+  const clearSheet = (batchIndex === 0);
+
+  try {
+    fetchOrganicBatch(batch.start, batch.end, clearSheet);
+  } catch (e) {
+    Logger.log('Error in organic batch ' + (batchIndex + 1) + ': ' + e);
+  }
+
+  // increment batch index
+  props.setProperty('organicBatchIndex', String(batchIndex + 1));
+
+  // schedule next batch
+  deleteOrganicTriggers();
+  ScriptApp.newTrigger(ORGANIC_TRIGGER_HANDLER)
+    .timeBased()
+    .after(2 * 60 * 1000)   // 2 minutes between batches; tweak if needed
+    .create();
+}
+
+
+function stopOrganicAutomation() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('organicRunning', 'false');
+  props.setProperty('organicStoppedAt', new Date().toISOString());
+  deleteOrganicTriggers();
+  Logger.log('Organic automation stopped.');
+}
+
+
+function checkOrganicAutomationStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const running = props.getProperty('organicRunning') === 'true';
+  const batchIndex = parseInt(props.getProperty('organicBatchIndex') || '0', 10);
+  const startTime = props.getProperty('organicStartTime');
+  const completedAt = props.getProperty('organicCompletedAt');
+
+  Logger.log('================ ORGANIC AUTOMATION STATUS ================');
+  Logger.log('Running flag: ' + (running ? 'TRUE' : 'FALSE'));
+  Logger.log('Batch index (0-based): ' + batchIndex);
+
+  const batches = ORGANIC_BATCH_CONFIG;
+  if (batches) {
+    Logger.log('Batch count: ' + batches.length);
+    Logger.log('Current human-readable batch: ' + (Math.min(batchIndex + 1, batches.length)) + '/' + batches.length);
+  }
+
+  if (startTime) {
+    Logger.log('Started: ' + startTime);
+    const elapsedMinutes = Math.round((new Date() - new Date(startTime)) / 1000 / 60);
+    Logger.log('Elapsed minutes: ' + elapsedMinutes);
+  }
+  if (completedAt) {
+    Logger.log('Last completed at: ' + completedAt);
+  }
+
+  const triggers = ScriptApp.getProjectTriggers().filter(function (t) {
+    return t.getHandlerFunction() === ORGANIC_TRIGGER_HANDLER;
+  });
+  Logger.log('Active organic automation triggers: ' + triggers.length);
+  Logger.log('===========================================================');
+}
+
+
+function deleteOrganicTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let deleted = 0;
+  triggers.forEach(function (trigger) {
+    if (trigger.getHandlerFunction() === ORGANIC_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+      deleted++;
+    }
+  });
+  if (deleted > 0) {
+    Logger.log('Deleted ' + deleted + ' organic automation trigger(s).');
+  }
+}
+
+
+// ==========================================================
+// HELPER FUNCTIONS
+// ==========================================================
+
+function getOrCreateSheet_(ss, name) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+  return sheet;
+}
+
+function initializeSheet_(sheet, headers) {
+  if (sheet.getLastRow() === 0 || sheet.getRange(1, 1).getValue() !== headers[0]) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+}
+
+function runTimestamp_() {
+  return Utilities.formatDate(
+    new Date(), 
+    Session.getScriptTimeZone(), 
+    'yyyy-MM-dd HH:mm:ss'
+  );
+}
+
+function authHeader_() {
+  // DFS_LOGIN and DFS_PASSWORD come from config.gs
+  const auth = Utilities.base64Encode(DFS_LOGIN + ':' + DFS_PASSWORD);
+  return { 'Authorization': 'Basic ' + auth };
+}
