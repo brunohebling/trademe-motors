@@ -1,0 +1,682 @@
+var ZEN_CONFIG = {
+  apiKey: 'c7445560-4a51-11f1-bc16-ef9414dcaed1',
+  inputSheetName: 'Final keywords',
+  location: 'New Zealand',
+  hl: 'en',
+  delayMs: 100,
+
+  // TIMEOUT SAFETY
+  maxExecutionTimeMs: 330000,  // 5 minutes (leave 60s buffer before 360s limit)
+
+  // Full automation runs twice daily (24-hour format)
+  fullAutomationHours: [7, 19],  // 7am and 7pm NZ time
+
+  // Output sheet names
+  outputSheets: {
+    mobile: 'AdsResultsZenMobile',
+    desktop: 'AdsResultsZenDesktop'
+  },
+
+  // Recovery settings
+  maxRunHours: 8,
+  maxBatchRetries: 2,
+  lockTimeoutMs: 30000,
+  rate429DelayMs: 5000
+};
+
+// Covers 3000 keywords (rows 2-1000) with 50 keywords per batch
+var ZEN_BATCH_CONFIG = {
+  mobile: [
+    { start: 2,   end: 51 },
+    { start: 52,  end: 101 },
+    { start: 102, end: 151 },
+    { start: 152, end: 201 },
+    { start: 202, end: 251 },
+    { start: 252, end: 301 },
+    { start: 302, end: 351 },
+    { start: 352, end: 401 },
+    { start: 402, end: 451 },
+    { start: 452, end: 501 },
+    { start: 502, end: 551 },
+    { start: 552, end: 601 },
+    { start: 602, end: 651 },
+    { start: 652, end: 701 },
+    { start: 702, end: 751 },
+    { start: 752, end: 801 },
+    { start: 802, end: 851 },
+    { start: 852, end: 901 },
+    { start: 902, end: 951 },
+    { start: 952, end: 1001 }
+  ],
+  desktop: [
+    { start: 2,   end: 51 },
+    { start: 52,  end: 101 },
+    { start: 102, end: 151 },
+    { start: 152, end: 201 },
+    { start: 202, end: 251 },
+    { start: 252, end: 301 },
+    { start: 302, end: 351 },
+    { start: 352, end: 401 },
+    { start: 402, end: 451 },
+    { start: 452, end: 501 },
+    { start: 502, end: 551 },
+    { start: 552, end: 601 },
+    { start: 602, end: 651 },
+    { start: 652, end: 701 },
+    { start: 702, end: 751 },
+    { start: 752, end: 801 },
+    { start: 802, end: 851 },
+    { start: 852, end: 901 },
+    { start: 902, end: 951 },
+    { start: 952, end: 1001 }
+  ]
+};
+
+var ZEN_TRIGGER_HANDLER = 'runZenserpAutomation';
+var ZEN_DAILY_STARTER   = 'startZenserpAutomation';
+var ZEN_WATCHDOG        = 'checkAbandonedFlags';
+
+
+// ==========================================================
+// AUTONOMOUS SETUP - RUN THIS ONCE
+// ==========================================================
+
+function setupFullyAutonomousSchedule() {
+  removeAllSchedules();
+
+  Logger.log('================ SETTING UP AUTONOMOUS SCHEDULE ================');
+  Logger.log('✓ Using 50-keyword batches to avoid timeout (360s limit)');
+  Logger.log('✓ Full run scheduled TWICE daily');
+  Logger.log('✓ Timeout detection: 5-minute limit per execution');
+  Logger.log('');
+
+  // Schedule full automation twice daily
+  ZEN_CONFIG.fullAutomationHours.forEach(function(hour) {
+    ScriptApp.newTrigger(ZEN_DAILY_STARTER)
+      .timeBased()
+      .everyDays(1)
+      .atHour(hour)
+      .nearMinute(0)
+      .create();
+    Logger.log('✓ Full automation scheduled for ' + hour + ':00 daily');
+  });
+
+  Logger.log('  → ' + ZEN_BATCH_CONFIG.mobile.length + ' batches × 2 devices per run');
+
+  // Watchdog
+  ScriptApp.newTrigger(ZEN_WATCHDOG)
+    .timeBased()
+    .everyHours(1)
+    .create();
+
+  Logger.log('✓ Watchdog scheduled every hour');
+  Logger.log('');
+  Logger.log('MATH CHECK:');
+  Logger.log('- 50 keywords/batch × 100ms sleep = 5 seconds');
+  Logger.log('- Leaves 325 seconds for API calls');
+  Logger.log('- Average: 6.5s per request (safe buffer)');
+  Logger.log('');
+  Logger.log('All triggers created. System will run autonomously from tomorrow.');
+  Logger.log('================================================================');
+}
+
+
+function removeAllSchedules() {
+  var triggers = ScriptApp.getProjectTriggers();
+  var deleted = 0;
+
+  var handlersToRemove = [
+    ZEN_TRIGGER_HANDLER,
+    ZEN_DAILY_STARTER,
+    ZEN_WATCHDOG
+  ];
+
+  triggers.forEach(function(trigger) {
+    if (handlersToRemove.indexOf(trigger.getHandlerFunction()) !== -1) {
+      ScriptApp.deleteTrigger(trigger);
+      deleted++;
+    }
+  });
+
+  Logger.log('Removed ' + deleted + ' trigger(s). All automation stopped.');
+
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('zenserpRunning', 'false');
+  props.deleteProperty('zenserpRetryCount');
+  props.deleteProperty('zenserpTriggerFailed');
+}
+
+
+// ==========================================================
+// WATCHDOG
+// ==========================================================
+
+function checkAbandonedFlags() {
+  var props = PropertiesService.getScriptProperties();
+  var running = props.getProperty('zenserpRunning') === 'true';
+
+  if (!running) return;
+
+  var startTime = props.getProperty('zenserpStartTime');
+
+  if (!startTime || startTime.trim() === '') {
+    Logger.log('⚠️ [WATCHDOG] Abandoned flag: running=true, no startTime. Clearing.');
+    props.setProperty('zenserpRunning', 'false');
+    props.setProperty('zenserpStoppedReason', 'watchdog_abandoned_' + new Date().toISOString());
+    deleteZenserpBatchTriggers();
+    return;
+  }
+
+  try {
+    var startDate = new Date(startTime);
+
+    if (isNaN(startDate.getTime())) {
+      Logger.log('⚠️ [WATCHDOG] Invalid startTime. Clearing.');
+      props.setProperty('zenserpRunning', 'false');
+      props.setProperty('zenserpStoppedReason', 'watchdog_invalid_time_' + new Date().toISOString());
+      deleteZenserpBatchTriggers();
+      return;
+    }
+
+    var hoursElapsed = (new Date() - startDate) / (1000 * 60 * 60);
+
+    if (hoursElapsed > ZEN_CONFIG.maxRunHours) {
+      Logger.log('⚠️ [WATCHDOG] Stuck run (' + hoursElapsed.toFixed(1) + 'h). Clearing.');
+      props.setProperty('zenserpRunning', 'false');
+      props.setProperty('zenserpStoppedReason', 'watchdog_timeout_' + new Date().toISOString());
+      deleteZenserpBatchTriggers();
+    }
+
+  } catch (e) {
+    Logger.log('⚠️ [WATCHDOG] Error: ' + e.message + '. Clearing.');
+    props.setProperty('zenserpRunning', 'false');
+    deleteZenserpBatchTriggers();
+  }
+}
+
+
+// ==========================================================
+// FULL AUTOMATION - TIMEOUT-AWARE
+// ==========================================================
+
+function startZenserpAutomation() {
+  var props = PropertiesService.getScriptProperties();
+
+  if (props.getProperty('zenserpRunning') === 'true') {
+    var startTime = props.getProperty('zenserpStartTime');
+    if (startTime && startTime.trim() !== '') {
+      try {
+        var startDate = new Date(startTime);
+        if (!isNaN(startDate.getTime())) {
+          var hoursElapsed = (new Date() - startDate) / (1000 * 60 * 60);
+          if (hoursElapsed > ZEN_CONFIG.maxRunHours) {
+            Logger.log('⚠️ Stale run (' + hoursElapsed.toFixed(1) + 'h). Auto-recovering.');
+            props.setProperty('zenserpRunning', 'false');
+            deleteZenserpBatchTriggers();
+          } else {
+            Logger.log('Already running. Skipping.');
+            return;
+          }
+        }
+      } catch (e) {
+        props.setProperty('zenserpRunning', 'false');
+      }
+    } else {
+      props.setProperty('zenserpRunning', 'false');
+    }
+  }
+
+  props.setProperty('zenserpRunning', 'true');
+  props.setProperty('zenserpDevice', 'mobile');
+  props.setProperty('zenserpBatchIndex', '0');
+  props.setProperty('zenserpStartTime', new Date().toISOString());
+  props.setProperty('zenserpRetryCount', '0');
+
+  deleteZenserpBatchTriggers();
+
+  Logger.log('================ STARTING FULL AUTOMATION ================');
+  Logger.log('Time: ' + new Date().toISOString());
+  Logger.log('Batch size: 50 keywords (timeout-safe)');
+  Logger.log('Total batches: ' + ZEN_BATCH_CONFIG.mobile.length + ' per device');
+  Logger.log('Expected timeline: ~' + (ZEN_BATCH_CONFIG.mobile.length * 4) + ' minutes');
+
+  // PATCHED: this trigger-creation call used to be unprotected. If it ever
+  // failed (even a brief hiccup), the whole function threw an uncaught
+  // exception — and since this is the function the daily trigger calls
+  // directly, that's exactly what gets a trigger auto-disabled by Google
+  // after enough failures in a row. This is almost certainly why
+  // StartZenserpAutomation kept going quiet after one clean run.
+  try {
+    ScriptApp.newTrigger(ZEN_TRIGGER_HANDLER)
+      .timeBased()
+      .after(60 * 1000)
+      .create();
+  } catch (e) {
+    Logger.log('✗ Could not create first batch trigger: ' + e.message);
+    props.setProperty('zenserpRunning', 'false');
+    props.setProperty('zenserpStartupFailure', new Date().toISOString() + ': ' + e.message);
+    // Re-throw so this failure still shows up clearly in the Executions
+    // log for diagnosis — but state above is left clean, not stuck "running".
+    throw e;
+  }
+}
+
+
+function runZenserpAutomation() {
+  var executionStart = new Date();
+  var props = PropertiesService.getScriptProperties();
+
+  if (props.getProperty('zenserpRunning') !== 'true') {
+    deleteZenserpBatchTriggers();
+    return;
+  }
+
+  var device    = props.getProperty('zenserpDevice') || 'mobile';
+  var batchIdx  = parseInt(props.getProperty('zenserpBatchIndex') || '0', 10);
+  var totalBatches = ZEN_BATCH_CONFIG.mobile.length;
+
+  // All done
+  if (device === 'mobile' && batchIdx >= totalBatches) {
+    Logger.log('✓ All batches complete!');
+    props.setProperty('zenserpRunning', 'false');
+    props.setProperty('zenserpCompletedAt', new Date().toISOString());
+    deleteZenserpBatchTriggers();
+    return;
+  }
+
+  var batches = ZEN_BATCH_CONFIG[device];
+  if (!batches || batchIdx >= batches.length) {
+    var nextDevice   = (device === 'mobile') ? 'desktop' : 'mobile';
+    var nextBatchIdx = (device === 'mobile') ? batchIdx : batchIdx + 1;
+
+    props.setProperty('zenserpDevice', nextDevice);
+    props.setProperty('zenserpBatchIndex', String(nextBatchIdx));
+    props.setProperty('zenserpRetryCount', '0');
+
+    Logger.log('Switching to ' + nextDevice + ' batches...');
+    scheduleNextBatch();
+    return;
+  }
+
+  var batch = batches[batchIdx];
+
+  Logger.log('Processing ' + device.toUpperCase() + ' batch ' + (batchIdx + 1) + '/' + totalBatches +
+    ' (rows ' + batch.start + '-' + batch.end + ')');
+
+  var clearSheet = (batchIdx === 0);
+
+  try {
+    getZenserpAds(device, batch.start, batch.end, clearSheet, executionStart);
+    props.setProperty('zenserpRetryCount', '0');
+
+  } catch (e) {
+    // PATCHED: maxBatchRetries was declared in config but never enforced —
+    // a genuinely broken batch used to retry the same batch every 2 minutes
+    // forever. Now it gives up after ZEN_CONFIG.maxBatchRetries attempts and
+    // moves on, instead of stalling the whole run indefinitely.
+    var retryCount = parseInt(props.getProperty('zenserpRetryCount') || '0', 10);
+
+    if (retryCount >= ZEN_CONFIG.maxBatchRetries) {
+      Logger.log('✗ Batch ' + batchIdx + ' failed ' + (retryCount + 1) + ' times (' + e.message + '). Skipping to next batch.');
+      var skipNextDevice   = (device === 'mobile') ? 'desktop' : 'mobile';
+      var skipNextBatchIdx = (device === 'mobile') ? batchIdx : batchIdx + 1;
+
+      props.setProperty('zenserpDevice', skipNextDevice);
+      props.setProperty('zenserpBatchIndex', String(skipNextBatchIdx));
+      props.setProperty('zenserpRetryCount', '0');
+      props.setProperty('zenserpLastBatch', device + '_' + batchIdx + '_skipped');
+      props.setProperty('zenserpLastBatchTime', new Date().toISOString());
+
+      scheduleNextBatch();
+      return;
+    }
+
+    Logger.log('⚠️ Batch error: ' + e.message);
+    Logger.log('Auto-resuming from batch ' + batchIdx + ' in 2 minutes... (retry ' + (retryCount + 1) + '/' + ZEN_CONFIG.maxBatchRetries + ')');
+    props.setProperty('zenserpRunning', 'true');
+    props.setProperty('zenserpRetryCount', String(retryCount + 1));
+    scheduleNextBatch(2);
+    return;
+  }
+
+  var nextDevice   = (device === 'mobile') ? 'desktop' : 'mobile';
+  var nextBatchIdx = (device === 'mobile') ? batchIdx : batchIdx + 1;
+
+  props.setProperty('zenserpDevice', nextDevice);
+  props.setProperty('zenserpBatchIndex', String(nextBatchIdx));
+  props.setProperty('zenserpLastBatch', device + '_' + batchIdx + '_ok');
+  props.setProperty('zenserpLastBatchTime', new Date().toISOString());
+
+  scheduleNextBatch();
+}
+
+
+function scheduleNextBatch(delayMinutes) {
+  delayMinutes = delayMinutes || 2;
+
+  deleteZenserpBatchTriggers();
+
+  try {
+    ScriptApp.newTrigger(ZEN_TRIGGER_HANDLER)
+      .timeBased()
+      .after(delayMinutes * 60 * 1000)
+      .create();
+
+  } catch (e) {
+    Logger.log('⚠️ Trigger creation failed: ' + e.message);
+    Utilities.sleep(5000);
+
+    try {
+      ScriptApp.newTrigger(ZEN_TRIGGER_HANDLER)
+        .timeBased()
+        .after((delayMinutes + 1) * 60 * 1000)
+        .create();
+      Logger.log('✓ Trigger created on retry');
+    } catch (e2) {
+      Logger.log('✗ Trigger creation failed again: ' + e2.message);
+      var props = PropertiesService.getScriptProperties();
+      props.setProperty('zenserpTriggerFailed', new Date().toISOString());
+    }
+  }
+}
+
+
+function getZenserpAds(device, startRow, endRow, clearSheet, executionStart) {
+  var ss          = SpreadsheetApp.getActiveSpreadsheet();
+  var inputSheet  = ss.getSheetByName(ZEN_CONFIG.inputSheetName);
+
+  var outputSheetName = device === 'mobile'
+    ? ZEN_CONFIG.outputSheets.mobile
+    : ZEN_CONFIG.outputSheets.desktop;
+
+  var outputSheet = ss.getSheetByName(outputSheetName);
+  if (!outputSheet) {
+    outputSheet = ss.insertSheet(outputSheetName);
+  }
+
+  if (!inputSheet) {
+    throw new Error('Input sheet not found.');
+  }
+
+  var lock = LockService.getScriptLock();
+
+  if (clearSheet) {
+    var header = ['Timestamp', 'Keyword', 'Ad Type', 'Ad Position',
+                  'Ad Title', 'Displayed Link', 'Ad Link', 'Ad Snippet'];
+    acquireLockAndWrite(lock, outputSheet, [header], true);
+  }
+
+  var lastInputRow = inputSheet.getLastRow();
+  if (startRow > lastInputRow) return;
+
+  var actualEndRow = Math.min(endRow, lastInputRow);
+  var numRows = actualEndRow - startRow + 1;
+  if (numRows <= 0) return;
+
+  var keywords = inputSheet
+    .getRange(startRow, 1, numRows, 1)
+    .getValues()
+    .flat()
+    .filter(String);
+
+  if (keywords.length === 0) return;
+
+  var rows = [];
+  var rate429Count = 0;
+
+  for (var i = 0; i < keywords.length; i++) {
+    var keyword = keywords[i];
+    var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+
+    // Timeout check
+    var elapsedMs = new Date() - executionStart;
+    if (elapsedMs > ZEN_CONFIG.maxExecutionTimeMs) {
+      Logger.log('⚠️ Timeout: ' + (elapsedMs / 1000).toFixed(1) + 's elapsed. Stopping at keyword ' + (i + 1) + '/' + keywords.length);
+      if (rate429Count >= 3) {
+        throw new Error('Timeout + rate limited. Will retry.');
+      }
+      break;
+    }
+
+    try {
+      var url      = buildZenserpUrl(keyword, device);
+      var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      var code     = response.getResponseCode();
+
+      if (code === 429) {
+        rate429Count++;
+        rows.push([ts, keyword, '', '', 'Rate Limited (429)', '', '', '']);
+        if (rate429Count >= 3) {
+          throw new Error('Batch rate limited (429).');
+        }
+        continue;
+      }
+
+      if (code !== 200) {
+        rows.push([ts, keyword, '', '', 'HTTP ' + code, '', '', '']);
+        continue;
+      }
+
+      var data  = JSON.parse(response.getContentText());
+      var found = 0;
+
+      if (data.ads) {
+        ['top', 'bottom'].forEach(function(pos) {
+          (data.ads[pos] || []).forEach(function(ad, idx) {
+            found++;
+            rows.push([
+              ts, keyword, pos + '_ads', ad.position || (idx + 1),
+              ad.title || '', ad.displayed_link || '',
+              ad.url || '', ad.snippet || ad.description || ''
+            ]);
+          });
+        });
+      }
+
+      if (data.paid) {
+        Object.keys(data.paid).forEach(function(k) {
+          var ad = data.paid[k];
+          found++;
+          rows.push([
+            ts, keyword, 'paid', k,
+            ad.title || '', ad.visurl || '',
+            ad.destinationUrl || ad.trackingUrl || '',
+            ad.description || ''
+          ]);
+        });
+      }
+
+      if (found === 0) {
+        rows.push([ts, keyword, '', '', 'No Ads Found', '', '', '']);
+      }
+
+    } catch (err) {
+      if (err.message && err.message.indexOf('429') !== -1) {
+        throw err;
+      } else if (err.message && (err.message.indexOf('fetch') !== -1 || err.message.indexOf('Connection') !== -1)) {
+        rows.push([ts, keyword, '', '', 'Network Error', '', '', '']);
+      } else {
+        throw err;
+      }
+    }
+
+    if (i < keywords.length - 1) {
+      Utilities.sleep(ZEN_CONFIG.delayMs);
+    }
+  }
+
+  if (rows.length > 0) {
+    acquireLockAndWrite(lock, outputSheet, rows, false);
+  }
+
+  if (rate429Count > 0) {
+    Logger.log('⚠️ Rate limited ' + rate429Count + ' times');
+  }
+
+  var duration = ((new Date() - executionStart) / 1000).toFixed(1);
+  Logger.log('Wrote ' + rows.length + ' rows in ' + duration + 's');
+}
+
+
+// ==========================================================
+// HELPERS
+// ==========================================================
+
+function buildZenserpUrl(keyword, device) {
+  return 'https://app.zenserp.com/api/v2/search?' +
+    'apikey=' + encodeURIComponent(ZEN_CONFIG.apiKey) +
+    '&q=' + encodeURIComponent(keyword) +
+    '&location=' + encodeURIComponent(ZEN_CONFIG.location) +
+    '&hl=' + encodeURIComponent(ZEN_CONFIG.hl) +
+    '&device=' + encodeURIComponent(device);
+}
+
+
+function acquireLockAndWrite(lock, sheet, rows, clear) {
+  var lockAcquired = false;
+
+  try {
+    lockAcquired = lock.tryLock(ZEN_CONFIG.lockTimeoutMs);
+
+    if (!lockAcquired) {
+      throw new Error('Could not acquire sheet lock after ' + ZEN_CONFIG.lockTimeoutMs + 'ms');
+    }
+
+    if (clear) {
+      sheet.clear();
+      if (rows.length > 0) {
+        sheet.appendRow(rows[0]);
+        if (rows.length > 1) {
+          sheet.getRange(2, 1, rows.length - 1, rows[0].length).setValues(rows.slice(1));
+        }
+      }
+    } else {
+      if (rows.length > 0) {
+        var nextRow = sheet.getLastRow() + 1;
+        sheet.getRange(nextRow, 1, rows.length, rows[0].length).setValues(rows);
+      }
+    }
+
+  } finally {
+    if (lockAcquired) {
+      lock.releaseLock();
+    }
+  }
+}
+
+
+function deleteZenserpBatchTriggers() {
+  var triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === ZEN_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+
+function stopZenserpAutomation() {
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('zenserpRunning', 'false');
+  props.setProperty('zenserpStoppedReason', 'manual_' + new Date().toISOString());
+  deleteZenserpBatchTriggers();
+  Logger.log('Automation stopped.');
+}
+
+
+function forceResetAndRestart() {
+  var props = PropertiesService.getScriptProperties();
+
+  Logger.log('================ FORCE RESET ================');
+
+  props.setProperty('zenserpRunning', 'false');
+  props.deleteProperty('zenserpDevice');
+  props.deleteProperty('zenserpBatchIndex');
+  props.deleteProperty('zenserpStartTime');
+  props.deleteProperty('zenserpRetryCount');
+
+  deleteZenserpBatchTriggers();
+
+  Logger.log('✓ State cleared.');
+  Logger.log('Run startZenserpAutomation() to restart');
+  Logger.log('Or wait for next scheduled run at ' + ZEN_CONFIG.fullAutomationHours.join(':00 or ') + ':00');
+}
+
+
+function forceResetAndStartNow() {
+  forceResetAndRestart();
+  Logger.log('Starting fresh automation now...');
+  startZenserpAutomation();
+}
+
+
+function checkAllZenserpStatus() {
+  var props = PropertiesService.getScriptProperties();
+
+  Logger.log('================ ZENSERP AUTOMATION STATUS ================');
+  Logger.log('Current time: ' + new Date().toISOString());
+  Logger.log('');
+
+  Logger.log('--- CONFIGURATION ---');
+  Logger.log('Batch size: 50 keywords (timeout-safe)');
+  Logger.log('Sleep per keyword: ' + ZEN_CONFIG.delayMs + 'ms');
+  Logger.log('Max execution time: ' + (ZEN_CONFIG.maxExecutionTimeMs / 1000).toFixed(0) + 's');
+  Logger.log('Scheduled runs: ' + ZEN_CONFIG.fullAutomationHours.join(':00, ') + ':00');
+  Logger.log('');
+
+  Logger.log('--- SCHEDULED TRIGGERS ---');
+  var triggers = ScriptApp.getProjectTriggers();
+  var dailyTriggers = triggers.filter(function(t) { return t.getHandlerFunction() === ZEN_DAILY_STARTER; });
+  var batchTriggers = triggers.filter(function(t) { return t.getHandlerFunction() === ZEN_TRIGGER_HANDLER; });
+
+  Logger.log('Daily full automation triggers: ' + dailyTriggers.length + ' (expected ' + ZEN_CONFIG.fullAutomationHours.length + ')');
+  Logger.log('Active batch triggers: ' + batchTriggers.length);
+  Logger.log('');
+
+  Logger.log('--- FULL AUTOMATION ---');
+  var running = props.getProperty('zenserpRunning') === 'true';
+  Logger.log('Currently running: ' + (running ? 'YES' : 'NO'));
+
+  if (running) {
+    var device   = props.getProperty('zenserpDevice');
+    var batchIdx = parseInt(props.getProperty('zenserpBatchIndex') || '0', 10);
+    var startTime = props.getProperty('zenserpStartTime');
+
+    Logger.log('Progress: ' + device + ' batch ' + (batchIdx + 1) + '/' + ZEN_BATCH_CONFIG.mobile.length);
+
+    if (startTime) {
+      var hoursElapsed = ((new Date() - new Date(startTime)) / (1000 * 60 * 60)).toFixed(1);
+      Logger.log('Running for: ' + hoursElapsed + ' hours');
+    }
+  }
+
+  var lastCompleted = props.getProperty('zenserpCompletedAt');
+  if (lastCompleted) Logger.log('Last completed: ' + lastCompleted);
+
+  var startupFailure = props.getProperty('zenserpStartupFailure');
+  if (startupFailure) Logger.log('⚠️ Last startup failure: ' + startupFailure);
+
+  Logger.log('');
+  Logger.log('==========================================================');
+}
+
+
+function isAutomationHealthy() {
+  var triggers = ScriptApp.getProjectTriggers();
+
+  var dailyTriggerCount = triggers.filter(function(t) {
+    return t.getHandlerFunction() === ZEN_DAILY_STARTER;
+  }).length;
+
+  var expectedTriggers = ZEN_CONFIG.fullAutomationHours.length;
+  var healthy = dailyTriggerCount === expectedTriggers;
+
+  Logger.log('Health check: ' + (healthy ? '✓ HEALTHY' : '✗ ISSUES'));
+  Logger.log('Daily triggers: ' + dailyTriggerCount + '/' + expectedTriggers);
+
+  if (!healthy) {
+    Logger.log('Run setupFullyAutonomousSchedule() to fix.');
+  }
+
+  return healthy;
+}
