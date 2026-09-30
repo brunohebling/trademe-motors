@@ -1,0 +1,37 @@
+/* ───── SHARED CONSTANTS ─────────────────────────────────── */
+const ORG_URL = 'https://api.dataforseo.com/v3/serp/google/organic/live/regular';
+const DELAY_MS = 100;   // polite 0.5 requests/sec
+
+/* ───── SHARED HELPER FUNCTIONS ──────────────────────────── */
+// Always return a valid sheet (creates if missing)
+function getOrCreateSheet_(ss, name) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    try { sh = ss.insertSheet(name); }
+    catch (e) { sh = ss.insertSheet(); sh.setName(name.trim()); }
+  }
+  return sh;
+}
+
+// Initialize sheet with headers if empty, but don't clear existing data
+function initializeSheet_(sheet, headerArr) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headerArr);
+  }
+}
+
+// Timestamp in the script's time-zone
+function runTimestamp_() {
+  return Utilities.formatDate(new Date(),
+                              Session.getScriptTimeZone(),
+                              'yyyy-MM-dd HH:mm:ss');
+}
+
+// Auth header for DataForSEO
+function authHeader_() {
+  return {
+    'Authorization':
+      'Basic ' + Utilities.base64Encode(DFS_LOGIN + ':' + DFS_PASSWORD),
+    'Content-Type': 'application/json'
+  };
+}
