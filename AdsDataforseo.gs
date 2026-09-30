@@ -2,7 +2,11 @@
  * PAID ADS VIA DATAFORSEO - SHADOW RUN (replaces Zenserp once parity is proven)
  *
  * Same batch/trigger/watchdog architecture as Multi Functions (Zenserp), but:
- *   - calls DataForSEO SERP live/advanced and keeps items where type == 'paid'
+ *   - calls DataForSEO SERP live/advanced and keeps 'paid' ads and 'shopping' ads
+ *   - DOUBLE-CHECK: every keyword/device is fetched twice (samplesPerKeyword); an advertiser
+ *     seen in either snapshot counts, and "No Ads Found" requires BOTH snapshots to succeed
+ *     with no ads. Any failure is written as an error row, never as 0 competitors
+ *   - one row per advertiser (deduped by domain), Displayed Link = ad domain
  *   - writes to SHADOW tabs (AdsResultsDFSMobile / AdsResultsDFSDesktop) using the
  *     same 8-column schema as the Zenserp tabs, so Combined Data can be re-pointed
  *     later without changing formulas
@@ -27,7 +31,8 @@ var ADS_DFS = {
   lastRow        : 1001,        // full run covers rows 2-1001 (1,000 keywords)
   sampleEndRow   : 101,         // parity test: set to a row number to cap the run; null = full run
   batchSize      : 50,
-  chunkSize      : 20,          // parallel requests per fetchAll call
+  chunkSize      : 10,          // keywords per fetchAll call (× samplesPerKeyword requests)
+  samplesPerKeyword: 2,         // double-check: independent SERP snapshots per keyword/device
   liveUrl        : 'https://api.dataforseo.com/v3/serp/google/organic/live/advanced',
   locationCode   : 2554,        // New Zealand
   languageCode   : 'en',
@@ -45,9 +50,8 @@ var ADS_DFS = {
 
   outputSheets: { mobile: 'AdsResultsDFSMobile', desktop: 'AdsResultsDFSDesktop' },
 
-  // Assumption - verify against your DataForSEO pricing/dashboard before go-live
-  costPerLiveCallUsd : 0.002,
-  dailyCapUsd        : 10
+  costPerLiveCallUsd : 0.002,   // measured on this account, 2026-09-30
+  dailyCapUsd        : 40       // set to the DataForSEO daily limit on the account
 };
 
 var ADS_DFS_HEADER = ['Timestamp', 'Keyword', 'Ad Type', 'Ad Position',
@@ -117,10 +121,10 @@ function adsDfsCostEstimate() {
   var lastRow = ADS_DFS.sampleEndRow || ADS_DFS.lastRow;
   var keywords = lastRow - ADS_DFS.firstRow + 1;
   var runsPerDay = ADS_DFS.fullAutomationHours.length;
-  var callsPerRun = keywords * 2;
+  var callsPerRun = keywords * 2 * ADS_DFS.samplesPerKeyword;
   var perDay = callsPerRun * runsPerDay * ADS_DFS.costPerLiveCallUsd;
   Logger.log('================ COST ESTIMATE (assumes $' + ADS_DFS.costPerLiveCallUsd + ' per live call) ================');
-  Logger.log(keywords + ' keywords × 2 devices = ' + callsPerRun + ' calls per run');
+  Logger.log(keywords + ' keywords × 2 devices × ' + ADS_DFS.samplesPerKeyword + ' snapshots = ' + callsPerRun + ' calls per run');
   Logger.log('Per run: $' + (callsPerRun * ADS_DFS.costPerLiveCallUsd).toFixed(2));
   Logger.log('Per day (' + runsPerDay + ' runs): $' + perDay.toFixed(2) + ' of the $' + ADS_DFS.dailyCapUsd + ' daily cap');
   Logger.log('This is ADDITIONAL to organic + search volume spend.');
@@ -355,32 +359,39 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
   return { complete: true, nextOffset: 0 };
 }
 
-/** Fetches a chunk of keywords in parallel; returns sheet rows. */
+/**
+ * Fetches a chunk of keywords in parallel; returns sheet rows.
+ * Each keyword is fetched ADS_DFS.samplesPerKeyword times (independent SERP snapshots),
+ * because ads rotate between page loads and one snapshot can miss a bidding competitor.
+ */
 function adsDfsFetchChunk_(chunk, device, ts) {
   var headers = adsDfsHeaders_();
-  var results = new Array(chunk.length);   // each: {rows: [...]} or {retry: true, reason: '...'}
+  var samples = ADS_DFS.samplesPerKeyword;
+  var results = chunk.map(function () { return []; });   // results[i][s] = parsed sample
+  var rows = [];
 
-  var pending = [];
+  var pending = [];   // jobs: {i: keyword index, s: sample index}
   chunk.forEach(function (kw, i) {
-    if (!kw) { results[i] = { rows: [] }; return; }                       // blank cell
+    if (!kw) return;                                                     // blank cell
     if (!adsDfsIsValidKeyword_(kw)) {
-      results[i] = { rows: [[ts, kw, '', '', ADS_DFS_SKIPPED, '', '', '']] };
+      Logger.log('Skipped invalid keyword: "' + kw + '"');
+      rows.push([ts, kw, '', '', ADS_DFS_SKIPPED, '', '', '']);
       return;
     }
-    pending.push(i);
+    for (var s = 0; s < samples; s++) pending.push({ i: i, s: s });
   });
 
   for (var attempt = 0; attempt <= ADS_DFS.maxRequestRetries && pending.length; attempt++) {
     if (attempt > 0) Utilities.sleep(ADS_DFS.rate429DelayMs / 2);
 
-    var requests = pending.map(function (i) {
+    var requests = pending.map(function (job) {
       return {
         url: ADS_DFS.liveUrl,
         method: 'post',
         muteHttpExceptions: true,
         headers: headers,
         payload: JSON.stringify([{
-          keyword       : chunk[i],
+          keyword       : chunk[job.i],
           location_code : ADS_DFS.locationCode,
           language_code : ADS_DFS.languageCode,
           device        : device,
@@ -394,19 +405,19 @@ function adsDfsFetchChunk_(chunk, device, ts) {
     try {
       responses = UrlFetchApp.fetchAll(requests);
     } catch (e) {
-      // whole call failed; treat every pending keyword as retryable
-      pending.forEach(function (i) { results[i] = { retry: true, reason: ADS_DFS_NET_ERR }; });
+      // whole call failed; every pending sample stays retryable
+      pending.forEach(function (job) { results[job.i][job.s] = { status: 'retry', reason: ADS_DFS_NET_ERR }; });
       continue;
     }
 
     var stillPending = [];
     var saw429 = false;
     responses.forEach(function (resp, j) {
-      var i = pending[j];
-      var parsed = adsDfsParseResponse_(chunk[i], resp.getResponseCode(), resp.getContentText(), ts);
-      results[i] = parsed;
-      if (parsed.retry) {
-        stillPending.push(i);
+      var job = pending[j];
+      var parsed = adsDfsParseResponse_(resp.getResponseCode(), resp.getContentText());
+      results[job.i][job.s] = parsed;
+      if (parsed.status === 'retry') {
+        stillPending.push(job);
         if (parsed.reason === 'HTTP 429') saw429 = true;
       }
     });
@@ -414,66 +425,129 @@ function adsDfsFetchChunk_(chunk, device, ts) {
     pending = stillPending;
   }
 
-  var rows = [];
-  results.forEach(function (r, i) {
-    if (r.retry) {
-      // out of retries: explicit error row - never "No Ads Found"
-      rows.push([ts, chunk[i], '', '', r.reason || ADS_DFS_NET_ERR, '', '', '']);
-    } else {
-      r.rows.forEach(function (row) { rows.push(row); });
-    }
+  var disagreed = 0;
+  chunk.forEach(function (kw, i) {
+    if (!kw || !results[i].length) return;
+    var combined = adsDfsCombineSamples_(kw, results[i], ts);
+    if (combined.disagreed) disagreed++;
+    combined.rows.forEach(function (row) { rows.push(row); });
   });
+  if (disagreed) Logger.log('Double-check: snapshots disagreed on ' + disagreed + ' keyword(s) in this chunk');
   return rows;
 }
 
 /**
- * Pure function (no Apps Script services) so it can be unit-tested outside the sheet.
- * Returns {rows:[...]} on a definitive answer, or {retry:true, reason} on a failure.
+ * Pure function: turns one API response into
+ *   {status:'ok', ads:[...]}      SERP fetched (ads may be empty = genuinely no ads)
+ *   {status:'empty'}              SERP fetched but contained no elements at all (suspicious)
+ *   {status:'error', reason}      definitive failure, retrying won't help
+ *   {status:'retry', reason}      transient failure
+ * Counts top-level 'paid' ads and 'shopping' (paid product listing) ads. Sitelinks nested
+ * inside a paid ad are ignored - they are not separate advertisers.
  */
-function adsDfsParseResponse_(keyword, httpCode, bodyText, ts) {
-  if (httpCode === 429) return { retry: true, reason: 'HTTP 429' };
-  if (httpCode >= 500)  return { retry: true, reason: 'HTTP ' + httpCode };
-  if (httpCode !== 200) return { retry: false, rows: [[ts, keyword, '', '', 'HTTP ' + httpCode, '', '', '']] };
+function adsDfsParseResponse_(httpCode, bodyText) {
+  if (httpCode === 429) return { status: 'retry', reason: 'HTTP 429' };
+  if (httpCode >= 500)  return { status: 'retry', reason: 'HTTP ' + httpCode };
+  if (httpCode !== 200) return { status: 'error', reason: 'HTTP ' + httpCode };
 
   var data;
   try { data = JSON.parse(bodyText); }
-  catch (e) { return { retry: true, reason: ADS_DFS_NET_ERR }; }
+  catch (e) { return { status: 'retry', reason: ADS_DFS_NET_ERR }; }
 
   var task = data && data.tasks && data.tasks[0];
-  if (!task) return { retry: true, reason: ADS_DFS_NET_ERR };
+  if (!task) return { status: 'retry', reason: ADS_DFS_NET_ERR };
 
   if (task.status_code !== 20000) {
     // 5xxxx = DataForSEO-side/transient; 4xxxx = our request is wrong, retrying won't help
-    if (task.status_code >= 50000) return { retry: true, reason: 'Task error ' + task.status_code };
-    return { retry: false, rows: [[ts, keyword, '', '', 'Task error ' + task.status_code, '', '', '']] };
+    if (task.status_code >= 50000) return { status: 'retry', reason: 'Task error ' + task.status_code };
+    return { status: 'error', reason: 'Task error ' + task.status_code };
   }
 
   var result = task.result && task.result[0];
-  if (!result) return { retry: true, reason: ADS_DFS_NET_ERR };
+  if (!result) return { status: 'retry', reason: ADS_DFS_NET_ERR };
 
   var items = Array.isArray(result.items) ? result.items : [];
-  if (items.length === 0) {
-    // A SERP with no elements at all is suspicious - do not report it as "0 competitors"
-    return { retry: false, rows: [[ts, keyword, '', '', ADS_DFS_EMPTY, '', '', '']] };
+  if (items.length === 0) return { status: 'empty' };
+
+  var ads = [];
+  items.forEach(function (it) {
+    if (!it) return;
+    if (it.type === 'paid') {
+      ads.push({
+        type: 'paid', pos: it.rank_group, title: it.title || '',
+        domain: it.domain || adsDfsHost_(it.url), url: it.url || '',
+        snippet: it.description || ''
+      });
+    } else if (it.type === 'shopping' && Array.isArray(it.items)) {
+      it.items.forEach(function (el, k) {
+        var host = adsDfsHost_(el.url);
+        // Google redirect links don't name the merchant; fall back to the source name
+        if (!host || /(^|\.)google\./.test(host)) host = String(el.source || host || '').toLowerCase();
+        ads.push({
+          type: 'shopping', pos: k + 1, title: el.title || '',
+          domain: host, url: el.url || '', snippet: el.description || ''
+        });
+      });
+    }
+  });
+  return { status: 'ok', ads: ads };
+}
+
+/**
+ * Merges the snapshots for one keyword into sheet rows.
+ *   - an ad seen in ANY successful snapshot counts (presence is proven even if another failed)
+ *   - "No Ads Found" only when EVERY snapshot succeeded and none had ads
+ *   - anything else is an error row, so a failure can never be read as 0 competitors
+ * One row per advertiser (deduped by domain + ad type), best position kept.
+ */
+function adsDfsCombineSamples_(keyword, samples, ts) {
+  var ok = samples.filter(function (r) { return r && r.status === 'ok'; });
+  var byKey = {};
+  var perSample = ok.map(function (r) {
+    var set = {};
+    r.ads.forEach(function (ad) {
+      var key = ad.type + '|' + adsDfsNormDomain_(ad.domain);
+      set[key] = true;
+      if (!byKey[key] || (ad.pos && ad.pos < byKey[key].pos)) byKey[key] = ad;
+    });
+    return Object.keys(set).sort().join(',');
+  });
+  var disagreed = perSample.some(function (x) { return x !== perSample[0]; });
+  var keys = Object.keys(byKey);
+
+  if (keys.length) {
+    return {
+      disagreed: disagreed,
+      rows: keys.map(function (k) {
+        var ad = byKey[k];
+        return [ts, keyword, ad.type, ad.pos || '', ad.title, ad.domain, ad.url, ad.snippet];
+      })
+    };
   }
 
-  var paid = items.filter(function (it) { return it && it.type === 'paid'; });
-  if (paid.length === 0) {
-    return { retry: false, rows: [[ts, keyword, '', '', ADS_DFS_NO_ADS, '', '', '']] };
+  if (ok.length === samples.length) {
+    return { disagreed: false, rows: [[ts, keyword, '', '', ADS_DFS_NO_ADS, '', '', '']] };
   }
 
-  return {
-    rows: paid.map(function (ad, idx) {
-      return [
-        ts, keyword, 'paid',
-        ad.rank_group || (idx + 1),
-        ad.title || '',
-        ad.breadcrumb || ad.domain || '',
-        ad.url || '',
-        ad.description || ''
-      ];
-    })
-  };
+  var failed = samples.filter(function (r) { return !r || r.status !== 'ok'; })[0] || {};
+  var reason = failed.status === 'empty' ? ADS_DFS_EMPTY : (failed.reason || ADS_DFS_NET_ERR);
+  return { disagreed: false, rows: [[ts, keyword, '', '', reason, '', '', '']] };
+}
+
+/** Host of a URL or display string: lowercase, no protocol/path. '' if none. */
+function adsDfsHost_(s) {
+  var m = String(s || '').trim().toLowerCase().match(/^(?:[a-z]+:\/\/)?([^\/\s›?#:]+)/);
+  return m ? m[1] : '';
+}
+
+function adsDfsNormDomain_(d) {
+  return adsDfsHost_(d).replace(/^www\./, '');
+}
+
+/** trademe.co.nz and any subdomain of it. */
+function adsDfsIsTradeMe_(d) {
+  var h = adsDfsNormDomain_(d);
+  return h === 'trademe.co.nz' || /\.trademe\.co\.nz$/.test(h);
 }
 
 /** Same rules DataForSEO batches silently fail on (from SearchVolDataforseo.gs) */
@@ -569,7 +643,10 @@ function compareAdsParity() {
   Logger.log('Parity: ' + same + ' same, ' + diff + ' DIFFERENT, ' + unknown + ' unknown, of ' + keywords.length);
 }
 
-/** keyword -> {n: non-trademe ad count, err: true if only an error/skip sentinel was seen} */
+/**
+ * keyword -> {n: distinct non-Trade Me advertiser domains, err: true if an error/skip row was
+ * seen and no advertiser was found}. Works on both the Zenserp and the DFS tabs.
+ */
 function adsDfsCountByKeyword_(sheet) {
   var map = {};
   if (!sheet || sheet.getLastRow() < 2) return map;
@@ -579,11 +656,16 @@ function adsDfsCountByKeyword_(sheet) {
     var kw = String(r[1] || '').trim();
     if (!kw) return;
     var title = String(r[4] || '');
-    var entry = map[kw] || (map[kw] = { n: 0, err: false });
+    var entry = map[kw] || (map[kw] = { domains: {}, hadErr: false });
     if (title === ADS_DFS_NO_ADS) return;
-    if (errTitles.indexOf(title) !== -1 || /^(HTTP |Task error)/.test(title)) { entry.err = true; return; }
-    var tm = /trademe\.co\.nz/i.test(String(r[5])) || /trademe\.co\.nz/i.test(String(r[6]));
-    if (!tm) entry.n++;
+    if (errTitles.indexOf(title) !== -1 || /^(HTTP |Task error)/.test(title)) { entry.hadErr = true; return; }
+    // Prefer the displayed domain; Zenserp ad links can be Google redirects
+    var host = adsDfsNormDomain_(r[5]) || adsDfsNormDomain_(r[6]);
+    if (host && !adsDfsIsTradeMe_(host)) entry.domains[host] = true;
+  });
+  Object.keys(map).forEach(function (kw) {
+    var n = Object.keys(map[kw].domains).length;
+    map[kw] = { n: n, err: map[kw].hadErr && n === 0 };
   });
   return map;
 }
@@ -595,7 +677,7 @@ function adsDfsBestTradeMeOrganic_(sheet) {
   vals.forEach(function (r) {
     var kw = String(r[0] || '').trim();
     var p = Number(r[1]);
-    if (!kw || isNaN(p) || !/trademe\.co\.nz/i.test(String(r[2]))) return;
+    if (!kw || isNaN(p) || !adsDfsIsTradeMe_(r[2])) return;
     if (best[kw] === undefined || p < best[kw]) best[kw] = p;
   });
   return best;
