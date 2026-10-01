@@ -1,67 +1,60 @@
 /**
- * PAID ADS VIA DATAFORSEO - SHADOW RUN (replaces Zenserp once parity is proven)
+ * PAID ADS VIA DATAFORSEO - drop-in replacement for the Zenserp script (Multi Functions)
  *
- * Same batch/trigger/watchdog architecture as Multi Functions (Zenserp), but:
- *   - calls DataForSEO SERP live/advanced and keeps 'paid' ads and 'shopping' ads
- *   - DOUBLE-CHECK: every keyword/device is fetched twice (samplesPerKeyword); an advertiser
- *     seen in either snapshot counts, and "No Ads Found" requires BOTH snapshots to succeed
- *     with no ads. Any failure is written as an error row, never as 0 competitors
- *   - one row per advertiser (deduped by domain), Displayed Link = ad domain
- *   - writes to SHADOW tabs (AdsResultsDFSMobile / AdsResultsDFSDesktop) using the
- *     same 8-column schema as the Zenserp tabs, so Combined Data can be re-pointed
- *     later without changing formulas
- *   - uses its own trigger handlers and script properties (adsDfs*), so it never
- *     touches the running Zenserp automation
- *   - resumes mid-batch: progress is saved after every chunk, so the 330s guard
- *     never silently drops keywords
+ * Same job, same schedule, same output as Zenserp. Only the provider changes:
+ *   - every keyword in 'Final keywords', mobile and desktop, Auckland, twice daily (7am / 7pm)
+ *   - DataForSEO SERP live/advanced; every 'paid' item is one row, tagged top_ads / bottom_ads
+ *   - same 8 columns and the same 'No Ads Found' / 'Network Error' / 'HTTP xxx' /
+ *     'Rate Limited (429)' rows as Zenserp, so Combined Data needs no changes
+ *     (DataForSEO account errors are written as 'API error <code>: <message>')
+ *   - one keyword per API call (as DataForSEO requires for live calls), one call at a time
+ *   - batches of 25 keywords, mobile -> desktop, watchdog, retries and sheet lock
+ *
+ * CHECK ONE KEYWORD: set testKeyword below and run testAdsDfsKeyword() (logs only, writes nothing).
  *
  * HOW TO USE
- *   1. Set ADS_DFS.sampleEndRow (e.g. 101 = first 100 keywords) for the parity test.
- *   2. Run adsDfsCostEstimate() and check it fits under the DataForSEO daily cap.
- *   3. Run startAdsDfsNow() for one shadow run, or setupAdsDfsShadowSchedule() for 7am/7pm.
- *   4. When the run has completed, run compareAdsParity() and review 'Parity Check'.
+ *   Test:     outputSheets = DFS tabs (default). Run startAdsDfsNow(), then compareAdsParity().
+ *   Go live:  set outputSheets to the Zen tab names, run removeLegacyZenserpTriggers(),
+ *             then setupAdsDfsSchedule().
  *
- * CREDENTIALS: read from Script Properties (DFS_LOGIN / DFS_PASSWORD) if set,
- * otherwise falls back to the constants in config.gs.
+ * CREDENTIALS: Script Properties DFS_LOGIN / DFS_PASSWORD if set, otherwise config.gs.
  */
 
 var ADS_DFS = {
   inputSheetName : 'Final keywords',
   firstRow       : 2,
-  lastRow        : 1001,        // full run covers rows 2-1001 (1,000 keywords)
-  sampleEndRow   : 101,         // parity test: set to a row number to cap the run; null = full run
-  batchSize      : 50,
-  chunkSize      : 10,          // keywords per fetchAll call (× samplesPerKeyword requests)
-  samplesPerKeyword: 2,         // double-check: independent SERP snapshots per keyword/device
+  lastRow        : 1001,        // stops earlier if the sheet has fewer keywords
+  batchSize      : 25,          // keywords per batch (one call takes ~8s on average, up to ~16s)
+  parallelRequests: 1,          // 1 = one keyword at a time, like Zenserp; raise to go faster
   liveUrl        : 'https://api.dataforseo.com/v3/serp/google/organic/live/advanced',
-  locationCode   : 2554,        // New Zealand
+  locationCode   : 1011036,     // Auckland, New Zealand
   languageCode   : 'en',
   seDomain       : 'google.co.nz',
   depth          : 10,
 
-  maxExecutionTimeMs : 330000,  // Apps Script limit is 360s
+  maxExecutionTimeMs : 270000,  // stop starting new calls after 4.5 min (limit is 6 min; a live call can take up to 2 min)
   fullAutomationHours: [7, 19], // 7am and 7pm (script time zone)
   maxRunHours        : 8,
   maxBatchRetries    : 2,
   maxRequestRetries  : 2,       // in-batch retries for a failed keyword
   lockTimeoutMs      : 30000,
   rate429DelayMs     : 5000,
-  delayBetweenChunksMs: 200,
 
+  // Test: DFS tabs. Go live: 'AdsResultsZenMobile' / 'AdsResultsZenDesktop'
   outputSheets: { mobile: 'AdsResultsDFSMobile', desktop: 'AdsResultsDFSDesktop' },
 
   costPerLiveCallUsd : 0.002,   // measured on this account, 2026-09-30
-  dailyCapUsd        : 40       // set to the DataForSEO daily limit on the account
+
+  testKeyword        : 'car insurance nz'   // used by testAdsDfsKeyword()
 };
 
 var ADS_DFS_HEADER = ['Timestamp', 'Keyword', 'Ad Type', 'Ad Position',
                       'Ad Title', 'Displayed Link', 'Ad Link', 'Ad Snippet'];
 
-// Sentinel values in the Ad Title column (same as the Zenserp script where they overlap)
-var ADS_DFS_NO_ADS   = 'No Ads Found';
-var ADS_DFS_NET_ERR  = 'Network Error';
-var ADS_DFS_SKIPPED  = 'Skipped (invalid keyword)';
-var ADS_DFS_EMPTY    = 'Empty SERP (check)';
+// Ad Title values for non-ad rows (same wording as the Zenserp script)
+var ADS_DFS_NO_ADS  = 'No Ads Found';
+var ADS_DFS_NET_ERR = 'Network Error';
+var ADS_DFS_429     = 'Rate Limited (429)';
 
 var ADS_DFS_HANDLER  = 'runAdsDfsAutomation';
 var ADS_DFS_STARTER  = 'startAdsDfsAutomation';
@@ -72,7 +65,7 @@ var ADS_DFS_WATCHDOG = 'checkAdsDfsAbandonedFlags';
 // SETUP / TEAR-DOWN
 // ==========================================================
 
-function setupAdsDfsShadowSchedule() {
+function setupAdsDfsSchedule() {
   removeAdsDfsSchedules();
 
   ADS_DFS.fullAutomationHours.forEach(function (hour) {
@@ -84,7 +77,6 @@ function setupAdsDfsShadowSchedule() {
   adsDfsCostEstimate();
 }
 
-/** Removes ONLY the DFS shadow triggers. Zenserp triggers are left alone. */
 function removeAdsDfsSchedules() {
   var deleted = 0;
   ScriptApp.getProjectTriggers().forEach(function (t) {
@@ -94,15 +86,11 @@ function removeAdsDfsSchedules() {
       deleted++;
     }
   });
-  var props = PropertiesService.getScriptProperties();
-  props.setProperty('adsDfsRunning', 'false');
+  PropertiesService.getScriptProperties().setProperty('adsDfsRunning', 'false');
   Logger.log('Removed ' + deleted + ' DFS ads trigger(s).');
 }
 
-/**
- * CUT-OVER ONLY: run this when the parity check has passed to stop Zenserp.
- * Deletes every trigger for the old Zenserp handlers and clears their state.
- */
+/** Go-live step: deletes every trigger for the old Zenserp handlers. */
 function removeLegacyZenserpTriggers() {
   var legacy = ['runZenserpAutomation', 'startZenserpAutomation', 'checkAbandonedFlags',
                 'getZenserpAdsMobile', 'getZenserpAdsDesktop'];
@@ -118,17 +106,13 @@ function removeLegacyZenserpTriggers() {
 }
 
 function adsDfsCostEstimate() {
-  var lastRow = ADS_DFS.sampleEndRow || ADS_DFS.lastRow;
-  var keywords = lastRow - ADS_DFS.firstRow + 1;
-  var runsPerDay = ADS_DFS.fullAutomationHours.length;
-  var callsPerRun = keywords * 2 * ADS_DFS.samplesPerKeyword;
-  var perDay = callsPerRun * runsPerDay * ADS_DFS.costPerLiveCallUsd;
-  Logger.log('================ COST ESTIMATE (assumes $' + ADS_DFS.costPerLiveCallUsd + ' per live call) ================');
-  Logger.log(keywords + ' keywords × 2 devices × ' + ADS_DFS.samplesPerKeyword + ' snapshots = ' + callsPerRun + ' calls per run');
-  Logger.log('Per run: $' + (callsPerRun * ADS_DFS.costPerLiveCallUsd).toFixed(2));
-  Logger.log('Per day (' + runsPerDay + ' runs): $' + perDay.toFixed(2) + ' of the $' + ADS_DFS.dailyCapUsd + ' daily cap');
-  Logger.log('This is ADDITIONAL to organic + search volume spend.');
-  return perDay;
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ADS_DFS.inputSheetName);
+  var keywords = Math.max(0, adsDfsLastRow_(sheet) - ADS_DFS.firstRow + 1);
+  var callsPerRun = keywords * 2;
+  var perRun = callsPerRun * ADS_DFS.costPerLiveCallUsd;
+  Logger.log(keywords + ' keywords × 2 devices = ' + callsPerRun + ' calls per run');
+  Logger.log('Per run: $' + perRun.toFixed(2) + ' | per day: $' +
+             (perRun * ADS_DFS.fullAutomationHours.length).toFixed(2));
 }
 
 
@@ -137,8 +121,7 @@ function adsDfsCostEstimate() {
 // ==========================================================
 
 function startAdsDfsNow() {
-  var props = PropertiesService.getScriptProperties();
-  props.setProperty('adsDfsRunning', 'false');
+  PropertiesService.getScriptProperties().setProperty('adsDfsRunning', 'false');
   deleteAdsDfsBatchTriggers_();
   startAdsDfsAutomation();
 }
@@ -147,10 +130,8 @@ function startAdsDfsAutomation() {
   var props = PropertiesService.getScriptProperties();
 
   if (props.getProperty('adsDfsRunning') === 'true') {
-    var startTime = props.getProperty('adsDfsStartTime');
-    var startDate = startTime ? new Date(startTime) : null;
-    if (startDate && !isNaN(startDate.getTime()) &&
-        (new Date() - startDate) / 3600000 <= ADS_DFS.maxRunHours) {
+    var startDate = new Date(props.getProperty('adsDfsStartTime') || '');
+    if (!isNaN(startDate.getTime()) && (new Date() - startDate) / 3600000 <= ADS_DFS.maxRunHours) {
       Logger.log('DFS ads run already in progress. Skipping.');
       return;
     }
@@ -167,7 +148,6 @@ function startAdsDfsAutomation() {
   deleteAdsDfsBatchTriggers_();
 
   Logger.log('================ STARTING DFS ADS RUN ================');
-  Logger.log('Batches per device: ' + adsDfsBuildBatches_().length);
 
   try {
     ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(60 * 1000).create();
@@ -190,12 +170,11 @@ function checkAdsDfsAbandonedFlags() {
   var props = PropertiesService.getScriptProperties();
   if (props.getProperty('adsDfsRunning') !== 'true') return;
 
-  var startTime = props.getProperty('adsDfsStartTime');
-  var startDate = startTime ? new Date(startTime) : null;
-  var hours = (startDate && !isNaN(startDate.getTime())) ? (new Date() - startDate) / 3600000 : null;
+  var startDate = new Date(props.getProperty('adsDfsStartTime') || '');
+  var hours = isNaN(startDate.getTime()) ? null : (new Date() - startDate) / 3600000;
 
   if (hours === null || hours > ADS_DFS.maxRunHours) {
-    Logger.log('⚠️ [WATCHDOG] Clearing stuck DFS ads run (' + (hours === null ? 'no valid startTime' : hours.toFixed(1) + 'h') + ').');
+    Logger.log('⚠️ [WATCHDOG] Clearing stuck DFS ads run.');
     props.setProperty('adsDfsRunning', 'false');
     props.setProperty('adsDfsStoppedReason', 'watchdog_' + new Date().toISOString());
     deleteAdsDfsBatchTriggers_();
@@ -209,7 +188,6 @@ function deleteAdsDfsBatchTriggers_() {
 }
 
 function scheduleNextAdsDfs_(delayMinutes) {
-  delayMinutes = delayMinutes || 1;
   deleteAdsDfsBatchTriggers_();
   try {
     ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(delayMinutes * 60 * 1000).create();
@@ -230,25 +208,19 @@ function scheduleNextAdsDfs_(delayMinutes) {
 // ORCHESTRATOR
 // ==========================================================
 
-function adsDfsBuildBatches_() {
-  var last = ADS_DFS.sampleEndRow ? Math.min(ADS_DFS.sampleEndRow, ADS_DFS.lastRow) : ADS_DFS.lastRow;
-  var batches = [];
-  for (var s = ADS_DFS.firstRow; s <= last; s += ADS_DFS.batchSize) {
-    batches.push({ start: s, end: Math.min(s + ADS_DFS.batchSize - 1, last) });
-  }
-  return batches;
-}
-
 function runAdsDfsAutomation() {
   var executionStart = new Date();
   var props = PropertiesService.getScriptProperties();
 
-  checkAdsDfsAbandonedFlags();   // guard against orphaned state on every entry
-
+  checkAdsDfsAbandonedFlags();
   if (props.getProperty('adsDfsRunning') !== 'true') {
     deleteAdsDfsBatchTriggers_();
     return;
   }
+
+  // Safety net: if Google kills this execution before it finishes, this trigger resumes the
+  // run from the last saved keyword. It is replaced by the normal trigger at the end.
+  scheduleNextAdsDfs_(7);
 
   var batches  = adsDfsBuildBatches_();
   var device   = props.getProperty('adsDfsDevice') || 'mobile';
@@ -265,7 +237,7 @@ function runAdsDfsAutomation() {
 
   var batch = batches[batchIdx];
   Logger.log('DFS ' + device.toUpperCase() + ' batch ' + (batchIdx + 1) + '/' + batches.length +
-             ' (rows ' + batch.start + '-' + batch.end + '), offset ' + offset);
+             ' (rows ' + batch.start + '-' + batch.end + ')');
 
   var result;
   try {
@@ -288,7 +260,7 @@ function runAdsDfsAutomation() {
   }
 
   if (!result.complete) {
-    // Hit the time guard mid-batch: resume from the saved offset
+    // Hit the time guard mid-batch: continue from where it stopped
     props.setProperty('adsDfsOffset', String(result.nextOffset));
     scheduleNextAdsDfs_(1);
     return;
@@ -298,6 +270,27 @@ function runAdsDfsAutomation() {
   props.setProperty('adsDfsLastBatchTime', new Date().toISOString());
   adsDfsAdvance_(props, device, batchIdx);
   scheduleNextAdsDfs_(1);
+}
+
+/** Batches of 50 rows, only as far as the keywords go. */
+function adsDfsBuildBatches_() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ADS_DFS.inputSheetName);
+  var last = Math.min(ADS_DFS.lastRow, adsDfsLastRow_(sheet));
+  var batches = [];
+  for (var s = ADS_DFS.firstRow; s <= last; s += ADS_DFS.batchSize) {
+    batches.push({ start: s, end: Math.min(s + ADS_DFS.batchSize - 1, last) });
+  }
+  return batches;
+}
+
+/** Last row with a keyword in column A (ignores formulas returning ''). */
+function adsDfsLastRow_(sheet) {
+  if (!sheet || sheet.getLastRow() < ADS_DFS.firstRow) return ADS_DFS.firstRow - 1;
+  var vals = sheet.getRange(ADS_DFS.firstRow, 1, sheet.getLastRow() - ADS_DFS.firstRow + 1, 1).getValues();
+  for (var i = vals.length - 1; i >= 0; i--) {
+    if (String(vals[i][0]).trim() !== '') return ADS_DFS.firstRow + i;
+  }
+  return ADS_DFS.firstRow - 1;
 }
 
 /** mobile -> desktop for the same batch, then on to the next batch. */
@@ -313,7 +306,7 @@ function adsDfsAdvance_(props, device, batchIdx) {
 
 
 // ==========================================================
-// FETCH ONE BATCH (resumable)
+// FETCH ONE BATCH
 // ==========================================================
 
 function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, executionStart) {
@@ -324,250 +317,177 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
   var outName = ADS_DFS.outputSheets[device];
   var outSheet = ss.getSheetByName(outName) || ss.insertSheet(outName);
   var lock = LockService.getScriptLock();
+  var props = PropertiesService.getScriptProperties();
 
-  if (clearSheet) {
-    adsDfsWrite_(lock, outSheet, [ADS_DFS_HEADER], true);
-  }
+  if (clearSheet) adsDfsWrite_(lock, outSheet, [ADS_DFS_HEADER], true);
 
-  var lastInputRow = inputSheet.getLastRow();
-  if (startRow > lastInputRow) return { complete: true, nextOffset: 0 };
-  var actualEnd = Math.min(endRow, lastInputRow);
-
-  // Keep blanks in place so offsets stay stable between executions
-  var raw = inputSheet.getRange(startRow, 1, actualEnd - startRow + 1, 1).getValues()
-                      .map(function (r) { return String(r[0] || '').trim(); });
-
-  var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+  var keywords = inputSheet.getRange(startRow, 1, endRow - startRow + 1, 1).getValues()
+                           .map(function (r) { return String(r[0] || '').trim(); });
+  var headers = adsDfsHeaders_();
   var pos = offset;
 
-  while (pos < raw.length) {
+  while (pos < keywords.length) {
     if (new Date() - executionStart > ADS_DFS.maxExecutionTimeMs) {
-      Logger.log('⚠️ Time guard hit at offset ' + pos + '/' + raw.length + '. Will resume.');
+      Logger.log('⚠️ Time guard hit at keyword ' + pos + '/' + keywords.length + '. Will continue.');
       return { complete: false, nextOffset: pos };
     }
-
-    var chunk = raw.slice(pos, pos + ADS_DFS.chunkSize);
-    var rows = adsDfsFetchChunk_(chunk, device, ts);
+    var chunk = keywords.slice(pos, pos + Math.max(1, ADS_DFS.parallelRequests));
+    var rows = adsDfsFetchChunk_(chunk, device, headers);
     if (rows.length) adsDfsWrite_(lock, outSheet, rows, false);
     pos += chunk.length;
-
-    if (pos < raw.length) Utilities.sleep(ADS_DFS.delayBetweenChunksMs);
+    props.setProperty('adsDfsOffset', String(pos));   // progress survives a killed execution
   }
 
-  Logger.log('✓ ' + device + ' rows ' + startRow + '-' + actualEnd + ' done in ' +
+  Logger.log('✓ ' + device + ' rows ' + startRow + '-' + endRow + ' done in ' +
              ((new Date() - executionStart) / 1000).toFixed(1) + 's');
   return { complete: true, nextOffset: 0 };
 }
 
 /**
- * Fetches a chunk of keywords in parallel; returns sheet rows.
- * Each keyword is fetched ADS_DFS.samplesPerKeyword times (independent SERP snapshots),
- * because ads rotate between page loads and one snapshot can miss a bidding competitor.
+ * Fetches each keyword in the chunk (one keyword per API call) and returns sheet rows.
+ * With parallelRequests = 1 this is a single call.
  */
-function adsDfsFetchChunk_(chunk, device, ts) {
-  var headers = adsDfsHeaders_();
-  var samples = ADS_DFS.samplesPerKeyword;
-  var results = chunk.map(function () { return []; });   // results[i][s] = parsed sample
-  var rows = [];
-
-  var pending = [];   // jobs: {i: keyword index, s: sample index}
-  chunk.forEach(function (kw, i) {
-    if (!kw) return;                                                     // blank cell
-    if (!adsDfsIsValidKeyword_(kw)) {
-      Logger.log('Skipped invalid keyword: "' + kw + '"');
-      rows.push([ts, kw, '', '', ADS_DFS_SKIPPED, '', '', '']);
-      return;
-    }
-    for (var s = 0; s < samples; s++) pending.push({ i: i, s: s });
-  });
+function adsDfsFetchChunk_(chunk, device, headers) {
+  var results = new Array(chunk.length);
+  var pending = [];
+  chunk.forEach(function (kw, i) { if (kw) pending.push(i); });
 
   for (var attempt = 0; attempt <= ADS_DFS.maxRequestRetries && pending.length; attempt++) {
-    if (attempt > 0) Utilities.sleep(ADS_DFS.rate429DelayMs / 2);
+    if (attempt > 0) Utilities.sleep(ADS_DFS.rate429DelayMs);
 
-    var requests = pending.map(function (job) {
-      return {
-        url: ADS_DFS.liveUrl,
-        method: 'post',
-        muteHttpExceptions: true,
-        headers: headers,
-        payload: JSON.stringify([{
-          keyword       : chunk[job.i],
-          location_code : ADS_DFS.locationCode,
-          language_code : ADS_DFS.languageCode,
-          device        : device,
-          se_domain     : ADS_DFS.seDomain,
-          depth         : ADS_DFS.depth
-        }])
-      };
-    });
-
+    var requests = pending.map(function (i) { return adsDfsRequest_(chunk[i], device, headers); });
     var responses;
     try {
       responses = UrlFetchApp.fetchAll(requests);
     } catch (e) {
-      // whole call failed; every pending sample stays retryable
-      pending.forEach(function (job) { results[job.i][job.s] = { status: 'retry', reason: ADS_DFS_NET_ERR }; });
+      Logger.log('Fetch failed: ' + e.message);
+      pending.forEach(function (i) { results[i] = { retry: true, reason: ADS_DFS_NET_ERR }; });
       continue;
     }
 
     var stillPending = [];
-    var saw429 = false;
     responses.forEach(function (resp, j) {
-      var job = pending[j];
-      var parsed = adsDfsParseResponse_(resp.getResponseCode(), resp.getContentText());
-      results[job.i][job.s] = parsed;
-      if (parsed.status === 'retry') {
-        stillPending.push(job);
-        if (parsed.reason === 'HTTP 429') saw429 = true;
-      }
+      var i = pending[j];
+      var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+      results[i] = adsDfsParseResponse_(chunk[i], resp.getResponseCode(), resp.getContentText(), ts);
+      if (results[i].retry) stillPending.push(i);
     });
-    if (saw429) Utilities.sleep(ADS_DFS.rate429DelayMs);
     pending = stillPending;
   }
 
-  var disagreed = 0;
-  chunk.forEach(function (kw, i) {
-    if (!kw || !results[i].length) return;
-    var combined = adsDfsCombineSamples_(kw, results[i], ts);
-    if (combined.disagreed) disagreed++;
-    combined.rows.forEach(function (row) { rows.push(row); });
+  var rows = [];
+  results.forEach(function (r, i) {
+    if (!r) return;
+    if (r.retry) {   // out of retries
+      var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+      Logger.log('✗ "' + chunk[i] + '" (' + device + '): ' + r.reason);
+      rows.push([ts, chunk[i], '', '', r.reason, '', '', '']);
+    } else {
+      r.rows.forEach(function (row) { rows.push(row); });
+    }
   });
-  if (disagreed) Logger.log('Double-check: snapshots disagreed on ' + disagreed + ' keyword(s) in this chunk');
   return rows;
 }
 
+/** One live task per request - DataForSEO allows only one task per live call. */
+function adsDfsRequest_(keyword, device, headers) {
+  return {
+    url: ADS_DFS.liveUrl,
+    method: 'post',
+    contentType: 'application/json',
+    muteHttpExceptions: true,
+    headers: headers,
+    payload: JSON.stringify([{
+      keyword       : keyword,
+      location_code : ADS_DFS.locationCode,
+      language_code : ADS_DFS.languageCode,
+      device        : device,
+      se_domain     : ADS_DFS.seDomain,
+      depth         : ADS_DFS.depth
+    }])
+  };
+}
+
+/** Logs what the script would write for ADS_DFS.testKeyword on both devices. Writes nothing. */
+function testAdsDfsKeyword() {
+  var headers = adsDfsHeaders_();
+  ['mobile', 'desktop'].forEach(function (device) {
+    var rows = adsDfsFetchChunk_([ADS_DFS.testKeyword], device, headers);
+    Logger.log('=== ' + ADS_DFS.testKeyword + ' | ' + device + ' | ' + rows.length + ' row(s)');
+    rows.forEach(function (r) { Logger.log(r.slice(2, 7).join(' | ')); });
+  });
+}
+
+// DataForSEO status codes worth retrying (docs: appendix/errors)
+//   40101 search engine error, 40103 task failed - resubmit, 40202 rate limit per minute,
+//   40209 too many simultaneous requests, 5xxxx internal / timeout / service unavailable
+var ADS_DFS_RETRY_CODES = [40101, 40103, 40202, 40209];
+
 /**
- * Pure function: turns one API response into
- *   {status:'ok', ads:[...]}      SERP fetched (ads may be empty = genuinely no ads)
- *   {status:'empty'}              SERP fetched but contained no elements at all (suspicious)
- *   {status:'error', reason}      definitive failure, retrying won't help
- *   {status:'retry', reason}      transient failure
- * Counts top-level 'paid' ads and 'shopping' (paid product listing) ads. Sitelinks nested
- * inside a paid ad are ignored - they are not separate advertisers.
+ * Pure function (no Apps Script services). One row per paid ad, like Zenserp:
+ * Ad Type is top_ads or bottom_ads (bottom = after the first organic result).
+ * Returns {rows:[...]} or {retry:true, reason} for a transient failure.
+ * DataForSEO returns HTTP 200 for almost everything; the real status is status_code
+ * at the top level and on each task.
  */
-function adsDfsParseResponse_(httpCode, bodyText) {
-  if (httpCode === 429) return { status: 'retry', reason: 'HTTP 429' };
-  if (httpCode >= 500)  return { status: 'retry', reason: 'HTTP ' + httpCode };
-  if (httpCode !== 200) return { status: 'error', reason: 'HTTP ' + httpCode };
+function adsDfsParseResponse_(keyword, httpCode, bodyText, ts) {
+  var errRow = function (text) { return { rows: [[ts, keyword, '', '', text, '', '', '']] }; };
+
+  if (httpCode === 429) return { retry: true, reason: ADS_DFS_429 };
+  if (httpCode >= 500)  return { retry: true, reason: 'HTTP ' + httpCode };
 
   var data;
   try { data = JSON.parse(bodyText); }
-  catch (e) { return { status: 'retry', reason: ADS_DFS_NET_ERR }; }
+  catch (e) { return httpCode === 200 ? { retry: true, reason: ADS_DFS_NET_ERR } : errRow('HTTP ' + httpCode); }
 
+  // Top-level status (e.g. 40100 bad login, 40200 / 40210 no balance, 40203 daily cost limit hit)
+  var top = data && data.status_code;
   var task = data && data.tasks && data.tasks[0];
-  if (!task) return { status: 'retry', reason: ADS_DFS_NET_ERR };
+  var code = (top && top !== 20000) ? top : (task ? task.status_code : null);
+  var msg  = (top && top !== 20000) ? data.status_message : (task ? task.status_message : '');
 
-  if (task.status_code !== 20000) {
-    // 5xxxx = DataForSEO-side/transient; 4xxxx = our request is wrong, retrying won't help
-    if (task.status_code >= 50000) return { status: 'retry', reason: 'Task error ' + task.status_code };
-    return { status: 'error', reason: 'Task error ' + task.status_code };
+  if (code === null) return { retry: true, reason: ADS_DFS_NET_ERR };
+  if (code !== 20000) {
+    var text = 'API error ' + code + (msg ? ': ' + msg : '');
+    if (code === 40202 || code === 40209) return { retry: true, reason: ADS_DFS_429 };
+    if (code >= 50000 || ADS_DFS_RETRY_CODES.indexOf(code) !== -1) return { retry: true, reason: text };
+    return errRow(text);   // e.g. bad login, no funds, cost limit, invalid field - retrying won't help
   }
 
   var result = task.result && task.result[0];
-  if (!result) return { status: 'retry', reason: ADS_DFS_NET_ERR };
+  var items = (result && Array.isArray(result.items)) ? result.items : null;
+  // No result or an empty page is a failed fetch, not "no ads"
+  if (!items || items.length === 0) return { retry: true, reason: ADS_DFS_NET_ERR };
 
-  var items = Array.isArray(result.items) ? result.items : [];
-  if (items.length === 0) return { status: 'empty' };
-
-  var ads = [];
+  var firstOrganic = Infinity;
   items.forEach(function (it) {
-    if (!it) return;
-    if (it.type === 'paid') {
-      ads.push({
-        type: 'paid', pos: it.rank_group, title: it.title || '',
-        domain: it.domain || adsDfsHost_(it.url), url: it.url || '',
-        snippet: it.description || ''
-      });
-    } else if (it.type === 'shopping' && Array.isArray(it.items)) {
-      it.items.forEach(function (el, k) {
-        var host = adsDfsHost_(el.url);
-        // Google redirect links don't name the merchant; fall back to the source name
-        if (!host || /(^|\.)google\./.test(host)) host = String(el.source || host || '').toLowerCase();
-        ads.push({
-          type: 'shopping', pos: k + 1, title: el.title || '',
-          domain: host, url: el.url || '', snippet: el.description || ''
-        });
-      });
-    }
+    if (it && it.type === 'organic' && it.rank_absolute < firstOrganic) firstOrganic = it.rank_absolute;
   });
-  return { status: 'ok', ads: ads };
-}
 
-/**
- * Merges the snapshots for one keyword into sheet rows.
- *   - an ad seen in ANY successful snapshot counts (presence is proven even if another failed)
- *   - "No Ads Found" only when EVERY snapshot succeeded and none had ads
- *   - anything else is an error row, so a failure can never be read as 0 competitors
- * One row per advertiser (deduped by domain + ad type), best position kept.
- */
-function adsDfsCombineSamples_(keyword, samples, ts) {
-  var ok = samples.filter(function (r) { return r && r.status === 'ok'; });
-  var byKey = {};
-  var perSample = ok.map(function (r) {
-    var set = {};
-    r.ads.forEach(function (ad) {
-      var key = ad.type + '|' + adsDfsNormDomain_(ad.domain);
-      set[key] = true;
-      if (!byKey[key] || (ad.pos && ad.pos < byKey[key].pos)) byKey[key] = ad;
-    });
-    return Object.keys(set).sort().join(',');
+  var counts = { top_ads: 0, bottom_ads: 0 };
+  var rows = [];
+  items.forEach(function (ad) {
+    if (!ad || ad.type !== 'paid') return;
+    var block = ad.rank_absolute > firstOrganic ? 'bottom_ads' : 'top_ads';
+    counts[block]++;
+    rows.push([
+      ts, keyword, block, counts[block],
+      ad.title || '',
+      ad.breadcrumb || ad.domain || '',
+      ad.url || '',
+      ad.description || ''
+    ]);
   });
-  var disagreed = perSample.some(function (x) { return x !== perSample[0]; });
-  var keys = Object.keys(byKey);
 
-  if (keys.length) {
-    return {
-      disagreed: disagreed,
-      rows: keys.map(function (k) {
-        var ad = byKey[k];
-        return [ts, keyword, ad.type, ad.pos || '', ad.title, ad.domain, ad.url, ad.snippet];
-      })
-    };
-  }
-
-  if (ok.length === samples.length) {
-    return { disagreed: false, rows: [[ts, keyword, '', '', ADS_DFS_NO_ADS, '', '', '']] };
-  }
-
-  var failed = samples.filter(function (r) { return !r || r.status !== 'ok'; })[0] || {};
-  var reason = failed.status === 'empty' ? ADS_DFS_EMPTY : (failed.reason || ADS_DFS_NET_ERR);
-  return { disagreed: false, rows: [[ts, keyword, '', '', reason, '', '', '']] };
-}
-
-/** Host of a URL or display string: lowercase, no protocol/path. '' if none. */
-function adsDfsHost_(s) {
-  var m = String(s || '').trim().toLowerCase().match(/^(?:[a-z]+:\/\/)?([^\/\s›?#:]+)/);
-  return m ? m[1] : '';
-}
-
-function adsDfsNormDomain_(d) {
-  return adsDfsHost_(d).replace(/^www\./, '');
-}
-
-/** trademe.co.nz and any subdomain of it. */
-function adsDfsIsTradeMe_(d) {
-  var h = adsDfsNormDomain_(d);
-  return h === 'trademe.co.nz' || /\.trademe\.co\.nz$/.test(h);
-}
-
-/** Same rules DataForSEO batches silently fail on (from SearchVolDataforseo.gs) */
-function adsDfsIsValidKeyword_(k) {
-  if (!k) return false;
-  if (/[,\[\]|"()]/.test(k)) return false;
-  if (k.split(/\s+/).length > 9) return false;
-  if (k.length > 80) return false;
-  if (/https?:\/\/|www\./i.test(k)) return false;
-  return true;
+  if (!rows.length) rows.push([ts, keyword, '', '', ADS_DFS_NO_ADS, '', '', '']);
+  return { rows: rows };
 }
 
 function adsDfsHeaders_() {
   var props = PropertiesService.getScriptProperties();
   var login = props.getProperty('DFS_LOGIN')    || DFS_LOGIN;
   var pass  = props.getProperty('DFS_PASSWORD') || DFS_PASSWORD;
-  return {
-    'Authorization': 'Basic ' + Utilities.base64Encode(login + ':' + pass),
-    'Content-Type' : 'application/json'
-  };
+  return { 'Authorization': 'Basic ' + Utilities.base64Encode(login + ':' + pass) };
 }
 
 function adsDfsWrite_(lock, sheet, rows, clear) {
@@ -579,8 +499,7 @@ function adsDfsWrite_(lock, sheet, rows, clear) {
       sheet.clear();
       sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
     } else if (rows.length) {
-      var next = sheet.getLastRow() + 1;
-      sheet.getRange(next, 1, rows.length, rows[0].length).setValues(rows);
+      sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
     }
   } finally {
     if (got) lock.releaseLock();
@@ -589,98 +508,58 @@ function adsDfsWrite_(lock, sheet, rows, clear) {
 
 
 // ==========================================================
-// PARITY CHECK: Zenserp tabs vs DFS shadow tabs
+// TEST ONLY: compare the DFS tabs with the Zen tabs
 // ==========================================================
 
 /**
- * Builds a 'Parity Check' tab: per keyword, competitor (non-trademe.co.nz) ad counts from
- * Zenserp vs DataForSEO for mobile and desktop, plus the paused/enabled decision each would
- * produce under the Combined Data rule (#1 organic AND 0 mobile AND 0 desktop competitors).
- * Rows flagged DIFFERENT are the ones to investigate. Keywords with an error sentinel on
- * either side are marked UNKNOWN rather than treated as 0 competitors.
+ * Writes a 'Parity Check' tab: per keyword, the number of non-Trade Me ads Zenserp and
+ * DataForSEO each found (mobile, desktop) and the latest timestamp on each side.
  */
 function compareAdsParity() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var last = ADS_DFS.sampleEndRow || ADS_DFS.lastRow;
   var kwSheet = ss.getSheetByName(ADS_DFS.inputSheetName);
-  var keywords = kwSheet.getRange(ADS_DFS.firstRow, 1, last - ADS_DFS.firstRow + 1, 1)
-                        .getValues().map(function (r) { return String(r[0] || '').trim(); })
-                        .filter(String);
+  var last = adsDfsLastRow_(kwSheet);
+  var keywords = kwSheet.getRange(ADS_DFS.firstRow, 1, last - ADS_DFS.firstRow + 1, 1).getValues()
+                        .map(function (r) { return String(r[0] || '').trim(); }).filter(String);
 
-  var zenM = adsDfsCountByKeyword_(ss.getSheetByName('AdsResultsZenMobile'));
-  var zenD = adsDfsCountByKeyword_(ss.getSheetByName('AdsResultsZenDesktop'));
-  var dfsM = adsDfsCountByKeyword_(ss.getSheetByName(ADS_DFS.outputSheets.mobile));
-  var dfsD = adsDfsCountByKeyword_(ss.getSheetByName(ADS_DFS.outputSheets.desktop));
-  var org  = adsDfsBestTradeMeOrganic_(ss.getSheetByName('Organic'));
+  var zm = adsDfsCount_(ss.getSheetByName('AdsResultsZenMobile'));
+  var dm = adsDfsCount_(ss.getSheetByName('AdsResultsDFSMobile'));
+  var zd = adsDfsCount_(ss.getSheetByName('AdsResultsZenDesktop'));
+  var dd = adsDfsCount_(ss.getSheetByName('AdsResultsDFSDesktop'));
 
-  var out = [['Keyword', 'TM organic pos',
-              'Zen mobile', 'DFS mobile', 'Zen desktop', 'DFS desktop',
-              'Zen decision', 'DFS decision', 'Result']];
-  var same = 0, diff = 0, unknown = 0;
-
+  var out = [['Keyword', 'Zen mobile', 'DFS mobile', 'Zen desktop', 'DFS desktop',
+              'Zen last run', 'DFS last run', 'Match (0 vs >0)']];
+  var match = 0, diff = 0;
   keywords.forEach(function (kw) {
-    var zm = zenM[kw], dm = dfsM[kw], zd = zenD[kw], dd = dfsD[kw];
-    var pos = org[kw];
-    var bad = [zm, dm, zd, dd].some(function (x) { return x === undefined || x.err; });
-    var decide = function (m, d) {
-      if (m === undefined || d === undefined || m.err || d.err) return 'unknown';
-      return (pos === 1 && m.n === 0 && d.n === 0) ? 'paused' : 'enabled';
-    };
-    var zDec = decide(zm, zd), dDec = decide(dm, dd);
-    var result;
-    if (bad || zDec === 'unknown' || dDec === 'unknown') { result = 'UNKNOWN'; unknown++; }
-    else if (zDec === dDec) { result = 'same'; same++; }
-    else { result = 'DIFFERENT'; diff++; }
-
-    var n = function (x) { return x === undefined ? 'n/a' : (x.err ? 'ERR' : x.n); };
-    out.push([kw, pos === undefined ? '' : pos, n(zm), n(dm), n(zd), n(dd), zDec, dDec, result]);
+    var v = [zm[kw], dm[kw], zd[kw], dd[kw]].map(function (x) { return x ? x.n : 'n/a'; });
+    var same = (v[0] > 0) === (v[1] > 0) && (v[2] > 0) === (v[3] > 0);
+    if (same) match++; else diff++;
+    out.push([kw, v[0], v[1], v[2], v[3],
+              (zm[kw] || zd[kw] || {}).ts || '', (dm[kw] || dd[kw] || {}).ts || '',
+              same ? 'yes' : 'NO']);
   });
 
   var sheet = ss.getSheetByName('Parity Check') || ss.insertSheet('Parity Check');
   sheet.clear();
   sheet.getRange(1, 1, out.length, out[0].length).setValues(out);
   sheet.setFrozenRows(1);
-  Logger.log('Parity: ' + same + ' same, ' + diff + ' DIFFERENT, ' + unknown + ' unknown, of ' + keywords.length);
+  Logger.log('Parity: ' + match + ' match, ' + diff + ' differ, of ' + keywords.length);
 }
 
-/**
- * keyword -> {n: distinct non-Trade Me advertiser domains, err: true if an error/skip row was
- * seen and no advertiser was found}. Works on both the Zenserp and the DFS tabs.
- */
-function adsDfsCountByKeyword_(sheet) {
+/** keyword -> {n: ads not on trademe.co.nz, ts: latest timestamp} */
+function adsDfsCount_(sheet) {
   var map = {};
   if (!sheet || sheet.getLastRow() < 2) return map;
-  var errTitles = [ADS_DFS_NET_ERR, ADS_DFS_SKIPPED, ADS_DFS_EMPTY, 'Rate Limited (429)'];
-  var vals = sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getValues();
-  vals.forEach(function (r) {
+  sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getValues().forEach(function (r) {
     var kw = String(r[1] || '').trim();
     if (!kw) return;
-    var title = String(r[4] || '');
-    var entry = map[kw] || (map[kw] = { domains: {}, hadErr: false });
-    if (title === ADS_DFS_NO_ADS) return;
-    if (errTitles.indexOf(title) !== -1 || /^(HTTP |Task error)/.test(title)) { entry.hadErr = true; return; }
-    // Prefer the displayed domain; Zenserp ad links can be Google redirects
-    var host = adsDfsNormDomain_(r[5]) || adsDfsNormDomain_(r[6]);
-    if (host && !adsDfsIsTradeMe_(host)) entry.domains[host] = true;
-  });
-  Object.keys(map).forEach(function (kw) {
-    var n = Object.keys(map[kw].domains).length;
-    map[kw] = { n: n, err: map[kw].hadErr && n === 0 };
+    var e = map[kw] || (map[kw] = { n: 0, ts: '' });
+    var ts = r[0] instanceof Date ? Utilities.formatDate(r[0], Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm') : String(r[0]);
+    if (ts > e.ts) e.ts = ts;
+    if (!r[2]) return;   // No Ads Found / error rows have no Ad Type
+    if (!/trademe\.co\.nz/i.test(String(r[5]) + ' ' + String(r[6]))) e.n++;
   });
   return map;
-}
-
-function adsDfsBestTradeMeOrganic_(sheet) {
-  var best = {};
-  if (!sheet || sheet.getLastRow() < 2) return best;
-  var vals = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
-  vals.forEach(function (r) {
-    var kw = String(r[0] || '').trim();
-    var p = Number(r[1]);
-    if (!kw || isNaN(p) || !adsDfsIsTradeMe_(r[2])) return;
-    if (best[kw] === undefined || p < best[kw]) best[kw] = p;
-  });
-  return best;
 }
 
 
@@ -690,21 +569,16 @@ function adsDfsBestTradeMeOrganic_(sheet) {
 
 function checkAdsDfsStatus() {
   var props = PropertiesService.getScriptProperties();
-  var running = props.getProperty('adsDfsRunning') === 'true';
-  var batches = adsDfsBuildBatches_().length;
   Logger.log('================ DFS ADS STATUS ================');
-  Logger.log('Running: ' + (running ? 'YES' : 'NO'));
-  if (running) {
-    Logger.log('Progress: ' + props.getProperty('adsDfsDevice') + ' batch ' +
-               (parseInt(props.getProperty('adsDfsBatchIndex') || '0', 10) + 1) + '/' + batches +
-               ', offset ' + props.getProperty('adsDfsOffset'));
-  }
-  ['adsDfsLastBatch', 'adsDfsLastBatchTime', 'adsDfsCompletedAt', 'adsDfsStoppedReason',
-   'adsDfsStartupFailure', 'adsDfsTriggerFailed'].forEach(function (k) {
-    var v = props.getProperty(k);
-    if (v) Logger.log(k + ': ' + v);
-  });
-  var t = ScriptApp.getProjectTriggers().map(function (x) { return x.getHandlerFunction(); });
-  Logger.log('Daily starters: ' + t.filter(function (h) { return h === ADS_DFS_STARTER; }).length +
+  Logger.log('Running: ' + (props.getProperty('adsDfsRunning') === 'true' ? 'YES' : 'NO'));
+  Logger.log('Output tabs: ' + ADS_DFS.outputSheets.mobile + ' / ' + ADS_DFS.outputSheets.desktop);
+  ['adsDfsDevice', 'adsDfsBatchIndex', 'adsDfsOffset', 'adsDfsLastBatch', 'adsDfsLastBatchTime',
+   'adsDfsCompletedAt', 'adsDfsStoppedReason', 'adsDfsStartupFailure', 'adsDfsTriggerFailed']
+    .forEach(function (k) {
+      var v = props.getProperty(k);
+      if (v) Logger.log(k + ': ' + v);
+    });
+  var handlers = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
+  Logger.log('Daily starters: ' + handlers.filter(function (h) { return h === ADS_DFS_STARTER; }).length +
              ' (expected ' + ADS_DFS.fullAutomationHours.length + ')');
 }
