@@ -21,9 +21,11 @@
  * the rows the script would write. Writes nothing.
  *
  * HOW TO USE
- *   Test:     outputSheets = DFS tabs (default). Run startAdsDfsNow(), then compareAdsParity().
- *   Go live:  set outputSheets to the Zen tab names, run removeLegacyZenserpTriggers(),
- *             then setupAdsDfsSchedule().
+ *   LIVE (current): outputSheets = the Zen tabs, so Combined Data reads these results.
+ *     One-off setup: stopAdsDfsAutomation(), removeLegacyZenserpTriggers(), setupAdsDfsSchedule().
+ *     After that it runs by itself at 7am and 7pm; the hourly watchdog continues a stalled run.
+ *   Test without touching live data: set outputSheets to the DFS tabs, run startAdsDfsNow(),
+ *     then compareAdsParity().
  *
  * CREDENTIALS: Script Properties DFS_LOGIN / DFS_PASSWORD if set, otherwise config.gs.
  */
@@ -55,8 +57,8 @@ var ADS_DFS = {
   lockTimeoutMs      : 30000,
   rate429DelayMs     : 5000,
 
-  // Test: DFS tabs. Go live: 'AdsResultsZenMobile' / 'AdsResultsZenDesktop'
-  outputSheets: { mobile: 'AdsResultsDFSMobile', desktop: 'AdsResultsDFSDesktop' },
+  // LIVE: Combined Data reads these tabs. For a test run use 'AdsResultsDFSMobile' / 'AdsResultsDFSDesktop'
+  outputSheets: { mobile: 'AdsResultsZenMobile', desktop: 'AdsResultsZenDesktop' },
 
   costPerLiveCallUsd : 0.002,   // measured on this account, 2026-09-30
 
@@ -105,19 +107,26 @@ function removeAdsDfsSchedules() {
   console.log('Removed ' + deleted + ' DFS ads trigger(s).');
 }
 
-/** Go-live step: deletes every trigger for the old Zenserp handlers. */
+/**
+ * Go-live step: deletes every trigger of the old Zenserp scripts (full and high-priority runs),
+ * then logs the triggers left in the project so you can check nothing old is still scheduled.
+ */
 function removeLegacyZenserpTriggers() {
   var legacy = ['runZenserpAutomation', 'startZenserpAutomation', 'checkAbandonedFlags',
-                'getZenserpAdsMobile', 'getZenserpAdsDesktop'];
+                'getZenserpAdsMobile', 'getZenserpAdsDesktop',
+                'runHighPriorityBatchMobile', 'runHighPriorityBatchDesktop'];
   var deleted = 0;
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (legacy.indexOf(t.getHandlerFunction()) !== -1) {
+    var h = t.getHandlerFunction();
+    if (legacy.indexOf(h) !== -1 || /zenserp/i.test(h)) {
       ScriptApp.deleteTrigger(t);
       deleted++;
     }
   });
   PropertiesService.getScriptProperties().setProperty('zenserpRunning', 'false');
   console.log('Removed ' + deleted + ' legacy Zenserp trigger(s).');
+  var left = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
+  console.log('Triggers still in this project: ' + (left.length ? left.join(', ') : 'none'));
 }
 
 function adsDfsCostEstimate() {
@@ -159,6 +168,7 @@ function startAdsDfsAutomation() {
   props.setProperty('adsDfsBatchIndex', '0');
   props.setProperty('adsDfsOffset', '0');
   props.setProperty('adsDfsStartTime', new Date().toISOString());
+  props.setProperty('adsDfsLastProgress', new Date().toISOString());
   props.setProperty('adsDfsRetryCount', '0');
   deleteAdsDfsBatchTriggers_();
 
@@ -189,6 +199,7 @@ function resumeAdsDfsNow() {
   var props = PropertiesService.getScriptProperties();
   props.setProperty('adsDfsRunning', 'true');
   props.setProperty('adsDfsStartTime', new Date().toISOString());   // fresh 8h for the watchdog
+  props.setProperty('adsDfsLastProgress', new Date().toISOString());
   props.setProperty('adsDfsRetryCount', '0');
   deleteAdsDfsBatchTriggers_();
   ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(ADS_DFS.stepGapSeconds * 1000).create();
@@ -197,7 +208,29 @@ function resumeAdsDfsNow() {
               ', keyword offset ' + (props.getProperty('adsDfsOffset') || '0'));
 }
 
+/** Hourly watchdog: clears a run stuck for more than maxRunHours and continues a stalled one. */
 function checkAdsDfsAbandonedFlags() {
+  adsDfsClearStuckRun_();
+  adsDfsResumeIfStalled_();
+}
+
+/**
+ * A run is stalled when it is marked running but no next step is scheduled and nothing has
+ * happened for 15 minutes (e.g. Google killed a step and the backup trigger was lost).
+ * The watchdog then continues it from where it got to, keeping the rows already written.
+ */
+function adsDfsResumeIfStalled_() {
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty('adsDfsRunning') !== 'true') return;
+  var waiting = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === ADS_DFS_HANDLER; });
+  var last = new Date(props.getProperty('adsDfsLastProgress') || props.getProperty('adsDfsStartTime') || '');
+  if (waiting || isNaN(last.getTime()) || new Date() - last < 15 * 60 * 1000) return;
+  console.log('⚠️ [WATCHDOG] Run stalled (nothing scheduled, no progress since ' + last.toISOString() + '). Continuing it.');
+  ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(ADS_DFS.stepGapSeconds * 1000).create();
+}
+
+/** Clears the running flag of a run that has gone on for more than maxRunHours. */
+function adsDfsClearStuckRun_() {
   var props = PropertiesService.getScriptProperties();
   if (props.getProperty('adsDfsRunning') !== 'true') return;
 
@@ -243,7 +276,7 @@ function runAdsDfsAutomation() {
   var executionStart = new Date();
   var props = PropertiesService.getScriptProperties();
 
-  checkAdsDfsAbandonedFlags();
+  adsDfsClearStuckRun_();
   if (props.getProperty('adsDfsRunning') !== 'true') {
     deleteAdsDfsBatchTriggers_();
     return;
@@ -252,6 +285,7 @@ function runAdsDfsAutomation() {
   // Safety net: if Google kills this execution before it finishes, this trigger resumes the
   // run from the last saved keyword. It is replaced by the normal trigger at the end.
   scheduleNextAdsDfs_(7 * 60);
+  props.setProperty('adsDfsLastProgress', new Date().toISOString());
 
   var batches = adsDfsBuildBatches_();
   var clock = adsDfsClock_(executionStart.getTime());   // one time budget for every batch in this step
@@ -383,6 +417,7 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
     if (rows.length) adsDfsWrite_(lock, outSheet, rows, false);
     pos += chunk.length;
     props.setProperty('adsDfsOffset', String(pos));   // progress survives a killed execution
+    props.setProperty('adsDfsLastProgress', new Date().toISOString());
     console.log(device + ': ' + pos + '/' + keywords.length + ' keywords done (rows ' + startRow + '-' + endRow + ')');
   }
 
@@ -718,7 +753,7 @@ function checkAdsDfsStatus() {
   console.log('================ DFS ADS STATUS ================');
   console.log('Running: ' + (props.getProperty('adsDfsRunning') === 'true' ? 'YES' : 'NO'));
   console.log('Output tabs: ' + ADS_DFS.outputSheets.mobile + ' / ' + ADS_DFS.outputSheets.desktop);
-  ['adsDfsDevice', 'adsDfsBatchIndex', 'adsDfsOffset', 'adsDfsStartTime', 'adsDfsLastBatch', 'adsDfsLastBatchTime',
+  ['adsDfsDevice', 'adsDfsBatchIndex', 'adsDfsOffset', 'adsDfsStartTime', 'adsDfsLastProgress', 'adsDfsLastBatch', 'adsDfsLastBatchTime',
    'adsDfsCompletedAt', 'adsDfsStoppedReason', 'adsDfsStartupFailure', 'adsDfsTriggerFailed']
     .forEach(function (k) {
       var v = props.getProperty(k);
@@ -728,7 +763,7 @@ function checkAdsDfsStatus() {
   var waiting = handlers.filter(function (h) { return h === ADS_DFS_HANDLER; }).length;
   console.log('Next step scheduled: ' + (waiting ? 'yes' : 'NO') +
               (props.getProperty('adsDfsRunning') === 'true' && !waiting
-                ? '  <- run is stalled: run resumeAdsDfsNow() to continue' : ''));
+                ? '  <- run is stalled: the hourly watchdog will continue it, or run resumeAdsDfsNow()' : ''));
   console.log('Daily starters: ' + handlers.filter(function (h) { return h === ADS_DFS_STARTER; }).length +
              ' (expected ' + ADS_DFS.fullAutomationHours.length + ')');
 }
