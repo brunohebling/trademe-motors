@@ -34,7 +34,8 @@ var ADS_DFS = {
   lastRow        : 1001,        // stops earlier if the sheet has fewer keywords
   batchSize      : 25,          // keywords per batch (one call takes ~8s on average, up to ~16s)
   samplesPerKeyword: 3,         // looks per keyword per device; ads rotate between page loads
-  parallelRequests: 5,          // keywords fetched at the same time (DataForSEO allows up to 30)
+  parallelRequests: 15,         // keywords fetched at the same time (DataForSEO allows up to 30).
+                                // Tested 1 Oct 2026: same results as 5 at once, about twice as fast
   liveUrl        : 'https://api.dataforseo.com/v3/serp/google/organic/live/advanced',
   locationCode   : 1011036,     // Auckland, New Zealand
   languageCode   : 'en',
