@@ -12,6 +12,8 @@
  *     because Google does not show ads on every page load. An ad seen in ANY look is written;
  *     'No Ads Found' only when every look succeeded and none had ads
  *   - batches of 25 keywords, mobile -> desktop, watchdog, retries and sheet lock
+ *   - each step uses up to ~5m45s of Google's 6-minute limit; progress is saved after every
+ *     5 keywords, and a stopped run can be continued with resumeAdsDfsNow()
  *
  * CHECK ONE KEYWORD: set testKeyword below and run testAdsDfsKeyword(). It logs each look and
  * the rows the script would write. Writes nothing.
@@ -37,7 +39,10 @@ var ADS_DFS = {
   seDomain       : 'google.co.nz',
   depth          : 10,
 
-  maxExecutionTimeMs : 270000,  // stop starting new calls after 4.5 min (limit is 6 min; a live call can take up to 2 min)
+  executionLimitMs   : 345000,  // every step finishes by 5m45s (Google kills executions at 6:00).
+                                // A new round of calls only starts if the slowest round so far in
+                                // this step would still finish before then
+  minCallMs          : 30000,   // a round of calls is assumed to take at least this long
   fullAutomationHours: [7, 19], // 7am and 7pm (script time zone)
   maxRunHours        : 8,
   maxBatchRetries    : 2,
@@ -75,10 +80,10 @@ function setupAdsDfsSchedule() {
 
   ADS_DFS.fullAutomationHours.forEach(function (hour) {
     ScriptApp.newTrigger(ADS_DFS_STARTER).timeBased().everyDays(1).atHour(hour).nearMinute(0).create();
-    Logger.log('✓ DFS ads run scheduled daily at ' + hour + ':00');
+    console.log('✓ DFS ads run scheduled daily at ' + hour + ':00');
   });
   ScriptApp.newTrigger(ADS_DFS_WATCHDOG).timeBased().everyHours(1).create();
-  Logger.log('✓ Watchdog scheduled hourly');
+  console.log('✓ Watchdog scheduled hourly');
   adsDfsCostEstimate();
 }
 
@@ -92,7 +97,7 @@ function removeAdsDfsSchedules() {
     }
   });
   PropertiesService.getScriptProperties().setProperty('adsDfsRunning', 'false');
-  Logger.log('Removed ' + deleted + ' DFS ads trigger(s).');
+  console.log('Removed ' + deleted + ' DFS ads trigger(s).');
 }
 
 /** Go-live step: deletes every trigger for the old Zenserp handlers. */
@@ -107,7 +112,7 @@ function removeLegacyZenserpTriggers() {
     }
   });
   PropertiesService.getScriptProperties().setProperty('zenserpRunning', 'false');
-  Logger.log('Removed ' + deleted + ' legacy Zenserp trigger(s).');
+  console.log('Removed ' + deleted + ' legacy Zenserp trigger(s).');
 }
 
 function adsDfsCostEstimate() {
@@ -115,8 +120,8 @@ function adsDfsCostEstimate() {
   var keywords = Math.max(0, adsDfsLastRow_(sheet) - ADS_DFS.firstRow + 1);
   var callsPerRun = keywords * 2 * ADS_DFS.samplesPerKeyword;
   var perRun = callsPerRun * ADS_DFS.costPerLiveCallUsd;
-  Logger.log(keywords + ' keywords × 2 devices × ' + ADS_DFS.samplesPerKeyword + ' looks = ' + callsPerRun + ' calls per run');
-  Logger.log('Per run: $' + perRun.toFixed(2) + ' | per day: $' +
+  console.log(keywords + ' keywords × 2 devices × ' + ADS_DFS.samplesPerKeyword + ' looks = ' + callsPerRun + ' calls per run');
+  console.log('Per run: $' + perRun.toFixed(2) + ' | per day: $' +
              (perRun * ADS_DFS.fullAutomationHours.length).toFixed(2));
 }
 
@@ -137,10 +142,10 @@ function startAdsDfsAutomation() {
   if (props.getProperty('adsDfsRunning') === 'true') {
     var startDate = new Date(props.getProperty('adsDfsStartTime') || '');
     if (!isNaN(startDate.getTime()) && (new Date() - startDate) / 3600000 <= ADS_DFS.maxRunHours) {
-      Logger.log('DFS ads run already in progress. Skipping.');
+      console.log('DFS ads run already in progress. Skipping.');
       return;
     }
-    Logger.log('⚠️ Stale DFS ads run. Auto-recovering.');
+    console.log('⚠️ Stale DFS ads run. Auto-recovering.');
     deleteAdsDfsBatchTriggers_();
   }
 
@@ -152,7 +157,7 @@ function startAdsDfsAutomation() {
   props.setProperty('adsDfsRetryCount', '0');
   deleteAdsDfsBatchTriggers_();
 
-  Logger.log('================ STARTING DFS ADS RUN ================');
+  console.log('================ STARTING DFS ADS RUN ================');
 
   try {
     ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(60 * 1000).create();
@@ -168,7 +173,23 @@ function stopAdsDfsAutomation() {
   props.setProperty('adsDfsRunning', 'false');
   props.setProperty('adsDfsStoppedReason', 'manual_' + new Date().toISOString());
   deleteAdsDfsBatchTriggers_();
-  Logger.log('DFS ads automation stopped.');
+  console.log('DFS ads automation stopped.');
+}
+
+/**
+ * Continues a stopped or stalled run from where it got to (same device, batch and keyword),
+ * keeping the rows already written. Use startAdsDfsNow() instead to start again from scratch.
+ */
+function resumeAdsDfsNow() {
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('adsDfsRunning', 'true');
+  props.setProperty('adsDfsStartTime', new Date().toISOString());   // fresh 8h for the watchdog
+  props.setProperty('adsDfsRetryCount', '0');
+  deleteAdsDfsBatchTriggers_();
+  ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(60 * 1000).create();
+  console.log('Resuming in 1 minute: ' + (props.getProperty('adsDfsDevice') || 'mobile') + ' batch ' +
+              (parseInt(props.getProperty('adsDfsBatchIndex') || '0', 10) + 1) +
+              ', keyword offset ' + (props.getProperty('adsDfsOffset') || '0'));
 }
 
 function checkAdsDfsAbandonedFlags() {
@@ -179,7 +200,7 @@ function checkAdsDfsAbandonedFlags() {
   var hours = isNaN(startDate.getTime()) ? null : (new Date() - startDate) / 3600000;
 
   if (hours === null || hours > ADS_DFS.maxRunHours) {
-    Logger.log('⚠️ [WATCHDOG] Clearing stuck DFS ads run.');
+    console.log('⚠️ [WATCHDOG] Clearing stuck DFS ads run.');
     props.setProperty('adsDfsRunning', 'false');
     props.setProperty('adsDfsStoppedReason', 'watchdog_' + new Date().toISOString());
     deleteAdsDfsBatchTriggers_();
@@ -197,13 +218,13 @@ function scheduleNextAdsDfs_(delayMinutes) {
   try {
     ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(delayMinutes * 60 * 1000).create();
   } catch (e) {
-    Logger.log('⚠️ Trigger creation failed: ' + e.message);
+    console.log('⚠️ Trigger creation failed: ' + e.message);
     Utilities.sleep(5000);
     try {
       ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after((delayMinutes + 1) * 60 * 1000).create();
     } catch (e2) {
       PropertiesService.getScriptProperties().setProperty('adsDfsTriggerFailed', new Date().toISOString());
-      Logger.log('✗ Trigger creation failed again: ' + e2.message);
+      console.log('✗ Trigger creation failed again: ' + e2.message);
     }
   }
 }
@@ -231,9 +252,11 @@ function runAdsDfsAutomation() {
   var device   = props.getProperty('adsDfsDevice') || 'mobile';
   var batchIdx = parseInt(props.getProperty('adsDfsBatchIndex') || '0', 10);
   var offset   = parseInt(props.getProperty('adsDfsOffset') || '0', 10);
+  console.log('Step start: ' + device + ' batch ' + (batchIdx + 1) + '/' + batches.length +
+              ', keyword offset ' + offset);
 
   if (batchIdx >= batches.length) {
-    Logger.log('✓ All DFS ads batches complete.');
+    console.log('✓ All DFS ads batches complete.');
     props.setProperty('adsDfsRunning', 'false');
     props.setProperty('adsDfsCompletedAt', new Date().toISOString());
     deleteAdsDfsBatchTriggers_();
@@ -241,7 +264,7 @@ function runAdsDfsAutomation() {
   }
 
   var batch = batches[batchIdx];
-  Logger.log('DFS ' + device.toUpperCase() + ' batch ' + (batchIdx + 1) + '/' + batches.length +
+  console.log('DFS ' + device.toUpperCase() + ' batch ' + (batchIdx + 1) + '/' + batches.length +
              ' (rows ' + batch.start + '-' + batch.end + ')');
 
   var result;
@@ -251,14 +274,14 @@ function runAdsDfsAutomation() {
   } catch (e) {
     var retryCount = parseInt(props.getProperty('adsDfsRetryCount') || '0', 10);
     if (retryCount >= ADS_DFS.maxBatchRetries) {
-      Logger.log('✗ Batch ' + batchIdx + ' (' + device + ') failed ' + (retryCount + 1) + ' times (' + e.message + '). Skipping.');
+      console.log('✗ Batch ' + batchIdx + ' (' + device + ') failed ' + (retryCount + 1) + ' times (' + e.message + '). Skipping.');
       props.setProperty('adsDfsLastBatch', device + '_' + batchIdx + '_skipped');
       props.setProperty('adsDfsRetryCount', '0');
       adsDfsAdvance_(props, device, batchIdx);
       scheduleNextAdsDfs_(1);
       return;
     }
-    Logger.log('⚠️ Batch error: ' + e.message + ' (retry ' + (retryCount + 1) + '/' + ADS_DFS.maxBatchRetries + ')');
+    console.log('⚠️ Batch error: ' + e.message + ' (retry ' + (retryCount + 1) + '/' + ADS_DFS.maxBatchRetries + ')');
     props.setProperty('adsDfsRetryCount', String(retryCount + 1));
     scheduleNextAdsDfs_(2);
     return;
@@ -329,21 +352,25 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
   var keywords = inputSheet.getRange(startRow, 1, endRow - startRow + 1, 1).getValues()
                            .map(function (r) { return String(r[0] || '').trim(); });
   var headers = adsDfsHeaders_();
+  var clock = adsDfsClock_(executionStart.getTime());
   var pos = offset;
 
   while (pos < keywords.length) {
-    if (new Date() - executionStart > ADS_DFS.maxExecutionTimeMs) {
-      Logger.log('⚠️ Time guard hit at keyword ' + pos + '/' + keywords.length + '. Will continue.');
+    var chunk = keywords.slice(pos, pos + Math.max(1, ADS_DFS.parallelRequests));
+    // The first group of every step always finishes, so a very slow API can't stall the run
+    var rows = adsDfsFetchChunk_(chunk, device, headers, clock, pos === offset);
+    if (rows === null) {
+      // Out of time part-way through this group: nothing written, the group is redone next step
+      console.log('⏱ Time limit reached at keyword ' + pos + '/' + keywords.length + '. Continuing in the next step.');
       return { complete: false, nextOffset: pos };
     }
-    var chunk = keywords.slice(pos, pos + Math.max(1, ADS_DFS.parallelRequests));
-    var rows = adsDfsFetchChunk_(chunk, device, headers);
     if (rows.length) adsDfsWrite_(lock, outSheet, rows, false);
     pos += chunk.length;
     props.setProperty('adsDfsOffset', String(pos));   // progress survives a killed execution
+    console.log(device + ': ' + pos + '/' + keywords.length + ' keywords done (rows ' + startRow + '-' + endRow + ')');
   }
 
-  Logger.log('✓ ' + device + ' rows ' + startRow + '-' + endRow + ' done in ' +
+  console.log('✓ ' + device + ' rows ' + startRow + '-' + endRow + ' done in ' +
              ((new Date() - executionStart) / 1000).toFixed(1) + 's');
   return { complete: true, nextOffset: 0 };
 }
@@ -351,11 +378,19 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
 /**
  * Looks at each keyword in the chunk samplesPerKeyword times (the looks for one keyword are
  * sequential, a few seconds apart) and returns the combined sheet rows.
+ * If there isn't time left in this step it returns null and the group is redone in the next
+ * step - unless mustFinish is set (first group of a step, so every step makes progress), in
+ * which case looks that couldn't run count as failed looks and can never become 'No Ads Found'.
  */
-function adsDfsFetchChunk_(chunk, device, headers) {
+function adsDfsFetchChunk_(chunk, device, headers, clock, mustFinish) {
   var looks = chunk.map(function () { return []; });
   for (var n = 0; n < ADS_DFS.samplesPerKeyword; n++) {
-    adsDfsFetchOnce_(chunk, device, headers).forEach(function (r, i) { if (r) looks[i].push(r); });
+    var once = adsDfsFetchOnce_(chunk, device, headers, clock, mustFinish);
+    if (once === null) {
+      if (!mustFinish) return null;
+      once = chunk.map(function () { return { retry: true, reason: ADS_DFS_NET_ERR }; });
+    }
+    once.forEach(function (r, i) { if (r) looks[i].push(r); });
   }
   var rows = [];
   chunk.forEach(function (kw, i) {
@@ -365,23 +400,34 @@ function adsDfsFetchChunk_(chunk, device, headers) {
   return rows;
 }
 
-/** One look at every keyword in the chunk, in parallel, with retries. Returns parsed results. */
-function adsDfsFetchOnce_(chunk, device, headers) {
+/**
+ * One look at every keyword in the chunk, in parallel, with retries. Returns parsed results.
+ * Returns null if there wasn't time to start the first round of calls (or a needed retry,
+ * unless mustFinish - then keywords still failing are returned as failed).
+ */
+function adsDfsFetchOnce_(chunk, device, headers, clock, mustFinish) {
   var results = new Array(chunk.length);
   var pending = [];
   chunk.forEach(function (kw, i) { if (kw) pending.push(i); });
 
   for (var attempt = 0; attempt <= ADS_DFS.maxRequestRetries && pending.length; attempt++) {
     if (attempt > 0) Utilities.sleep(ADS_DFS.rate429DelayMs);
+    if (clock && !clock.canStart()) {
+      if (attempt === 0 || !mustFinish) return null;
+      break;
+    }
 
     var requests = pending.map(function (i) { return adsDfsRequest_(chunk[i], device, headers); });
     var responses;
+    var t0 = Date.now();
     try {
       responses = UrlFetchApp.fetchAll(requests);
     } catch (e) {
-      Logger.log('Fetch failed: ' + e.message);
+      console.log('Fetch failed: ' + e.message);
       pending.forEach(function (i) { results[i] = { retry: true, reason: ADS_DFS_NET_ERR }; });
       continue;
+    } finally {
+      if (clock) clock.record(Date.now() - t0);
     }
 
     var stillPending = [];
@@ -393,6 +439,18 @@ function adsDfsFetchOnce_(chunk, device, headers) {
     pending = stillPending;
   }
   return results;
+}
+
+/**
+ * Time budget for one step. A round of calls may only start if, taking as long as the slowest
+ * round so far (at least minCallMs), it would still end before executionLimitMs.
+ */
+function adsDfsClock_(startMs) {
+  var slowest = ADS_DFS.minCallMs;
+  return {
+    canStart: function () { return Date.now() + slowest < startMs + ADS_DFS.executionLimitMs; },
+    record: function (ms) { if (ms > slowest) slowest = ms; }
+  };
 }
 
 /**
@@ -422,7 +480,7 @@ function adsDfsCombine_(keyword, looks, device) {
   }
   var failed = looks.filter(function (r) { return !r || r.retry || r.error; })[0] || {};
   var reason = failed.retry ? failed.reason : (failed.rows ? failed.rows[0][4] : ADS_DFS_NET_ERR);
-  if (typeof Logger !== 'undefined') Logger.log('✗ "' + keyword + '" (' + device + '): ' + reason);
+  console.log('✗ "' + keyword + '" (' + device + '): ' + reason);
   return [[adsDfsNow_(), keyword, '', '', reason || ADS_DFS_NET_ERR, '', '', '']];
 }
 
@@ -463,7 +521,7 @@ function adsDfsRequest_(keyword, device, headers) {
 function testAdsDfsKeyword() {
   var headers = adsDfsHeaders_();
   var kw = ADS_DFS.testKeyword;
-  Logger.log('Keyword: "' + kw + '" | location_code ' + ADS_DFS.locationCode);
+  console.log('Keyword: "' + kw + '" | location_code ' + ADS_DFS.locationCode);
   ['mobile', 'desktop'].forEach(function (device) {
     var looks = [];
     for (var n = 1; n <= ADS_DFS.samplesPerKeyword; n++) {
@@ -479,14 +537,14 @@ function testAdsDfsKeyword() {
       var parsed = adsDfsParseResponse_(kw, resp.getResponseCode(), body, adsDfsNow_());
       looks.push(parsed);
       var ads = parsed.rows ? parsed.rows.filter(function (r) { return r[2]; }) : [];
-      Logger.log('--- ' + device + ' look ' + n + ': ' +
+      console.log('--- ' + device + ' look ' + n + ': ' +
                  (ads.length ? ads.map(function (r) { return adsDfsHost_(r[5]); }).join(', ')
                              : (parsed.retry ? parsed.reason : parsed.rows[0][4])));
-      Logger.log('    ' + info);
+      console.log('    ' + info);
     }
     var rows = adsDfsCombine_(kw, looks, device);
-    Logger.log('=== ' + device + ' WRITES ' + rows.length + ' row(s):');
-    rows.forEach(function (r) { Logger.log('    ' + r.slice(2, 6).join(' | ')); });
+    console.log('=== ' + device + ' WRITES ' + rows.length + ' row(s):');
+    rows.forEach(function (r) { console.log('    ' + r.slice(2, 6).join(' | ')); });
   });
 }
 
@@ -615,7 +673,7 @@ function compareAdsParity() {
   sheet.clear();
   sheet.getRange(1, 1, out.length, out[0].length).setValues(out);
   sheet.setFrozenRows(1);
-  Logger.log('Parity: ' + match + ' match, ' + diff + ' differ, of ' + keywords.length);
+  console.log('Parity: ' + match + ' match, ' + diff + ' differ, of ' + keywords.length);
 }
 
 /** keyword -> {n: ads not on trademe.co.nz, ts: latest timestamp} */
@@ -641,16 +699,20 @@ function adsDfsCount_(sheet) {
 
 function checkAdsDfsStatus() {
   var props = PropertiesService.getScriptProperties();
-  Logger.log('================ DFS ADS STATUS ================');
-  Logger.log('Running: ' + (props.getProperty('adsDfsRunning') === 'true' ? 'YES' : 'NO'));
-  Logger.log('Output tabs: ' + ADS_DFS.outputSheets.mobile + ' / ' + ADS_DFS.outputSheets.desktop);
-  ['adsDfsDevice', 'adsDfsBatchIndex', 'adsDfsOffset', 'adsDfsLastBatch', 'adsDfsLastBatchTime',
+  console.log('================ DFS ADS STATUS ================');
+  console.log('Running: ' + (props.getProperty('adsDfsRunning') === 'true' ? 'YES' : 'NO'));
+  console.log('Output tabs: ' + ADS_DFS.outputSheets.mobile + ' / ' + ADS_DFS.outputSheets.desktop);
+  ['adsDfsDevice', 'adsDfsBatchIndex', 'adsDfsOffset', 'adsDfsStartTime', 'adsDfsLastBatch', 'adsDfsLastBatchTime',
    'adsDfsCompletedAt', 'adsDfsStoppedReason', 'adsDfsStartupFailure', 'adsDfsTriggerFailed']
     .forEach(function (k) {
       var v = props.getProperty(k);
-      if (v) Logger.log(k + ': ' + v);
+      if (v) console.log(k + ': ' + v);
     });
   var handlers = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
-  Logger.log('Daily starters: ' + handlers.filter(function (h) { return h === ADS_DFS_STARTER; }).length +
+  var waiting = handlers.filter(function (h) { return h === ADS_DFS_HANDLER; }).length;
+  console.log('Next step scheduled: ' + (waiting ? 'yes' : 'NO') +
+              (props.getProperty('adsDfsRunning') === 'true' && !waiting
+                ? '  <- run is stalled: run resumeAdsDfsNow() to continue' : ''));
+  console.log('Daily starters: ' + handlers.filter(function (h) { return h === ADS_DFS_STARTER; }).length +
              ' (expected ' + ADS_DFS.fullAutomationHours.length + ')');
 }
