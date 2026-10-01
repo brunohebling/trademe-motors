@@ -7,10 +7,14 @@
  *   - same 8 columns and the same 'No Ads Found' / 'Network Error' / 'HTTP xxx' /
  *     'Rate Limited (429)' rows as Zenserp, so Combined Data needs no changes
  *     (DataForSEO account errors are written as 'API error <code>: <message>')
- *   - one keyword per API call (as DataForSEO requires for live calls), one call at a time
+ *   - one keyword per API call (as DataForSEO requires for live calls)
+ *   - each keyword is looked at samplesPerKeyword (3) times per device, a few seconds apart,
+ *     because Google does not show ads on every page load. An ad seen in ANY look is written;
+ *     'No Ads Found' only when every look succeeded and none had ads
  *   - batches of 25 keywords, mobile -> desktop, watchdog, retries and sheet lock
  *
- * CHECK ONE KEYWORD: set testKeyword below and run testAdsDfsKeyword() (logs only, writes nothing).
+ * CHECK ONE KEYWORD: set testKeyword below and run testAdsDfsKeyword(). It logs each look and
+ * the rows the script would write. Writes nothing.
  *
  * HOW TO USE
  *   Test:     outputSheets = DFS tabs (default). Run startAdsDfsNow(), then compareAdsParity().
@@ -25,7 +29,8 @@ var ADS_DFS = {
   firstRow       : 2,
   lastRow        : 1001,        // stops earlier if the sheet has fewer keywords
   batchSize      : 25,          // keywords per batch (one call takes ~8s on average, up to ~16s)
-  parallelRequests: 1,          // 1 = one keyword at a time, like Zenserp; raise to go faster
+  samplesPerKeyword: 3,         // looks per keyword per device; ads rotate between page loads
+  parallelRequests: 5,          // keywords fetched at the same time (DataForSEO allows up to 30)
   liveUrl        : 'https://api.dataforseo.com/v3/serp/google/organic/live/advanced',
   locationCode   : 1011036,     // Auckland, New Zealand
   languageCode   : 'en',
@@ -108,9 +113,9 @@ function removeLegacyZenserpTriggers() {
 function adsDfsCostEstimate() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ADS_DFS.inputSheetName);
   var keywords = Math.max(0, adsDfsLastRow_(sheet) - ADS_DFS.firstRow + 1);
-  var callsPerRun = keywords * 2;
+  var callsPerRun = keywords * 2 * ADS_DFS.samplesPerKeyword;
   var perRun = callsPerRun * ADS_DFS.costPerLiveCallUsd;
-  Logger.log(keywords + ' keywords × 2 devices = ' + callsPerRun + ' calls per run');
+  Logger.log(keywords + ' keywords × 2 devices × ' + ADS_DFS.samplesPerKeyword + ' looks = ' + callsPerRun + ' calls per run');
   Logger.log('Per run: $' + perRun.toFixed(2) + ' | per day: $' +
              (perRun * ADS_DFS.fullAutomationHours.length).toFixed(2));
 }
@@ -344,10 +349,24 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
 }
 
 /**
- * Fetches each keyword in the chunk (one keyword per API call) and returns sheet rows.
- * With parallelRequests = 1 this is a single call.
+ * Looks at each keyword in the chunk samplesPerKeyword times (the looks for one keyword are
+ * sequential, a few seconds apart) and returns the combined sheet rows.
  */
 function adsDfsFetchChunk_(chunk, device, headers) {
+  var looks = chunk.map(function () { return []; });
+  for (var n = 0; n < ADS_DFS.samplesPerKeyword; n++) {
+    adsDfsFetchOnce_(chunk, device, headers).forEach(function (r, i) { if (r) looks[i].push(r); });
+  }
+  var rows = [];
+  chunk.forEach(function (kw, i) {
+    if (!kw) return;
+    adsDfsCombine_(kw, looks[i], device).forEach(function (row) { rows.push(row); });
+  });
+  return rows;
+}
+
+/** One look at every keyword in the chunk, in parallel, with retries. Returns parsed results. */
+function adsDfsFetchOnce_(chunk, device, headers) {
   var results = new Array(chunk.length);
   var pending = [];
   chunk.forEach(function (kw, i) { if (kw) pending.push(i); });
@@ -368,25 +387,53 @@ function adsDfsFetchChunk_(chunk, device, headers) {
     var stillPending = [];
     responses.forEach(function (resp, j) {
       var i = pending[j];
-      var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
-      results[i] = adsDfsParseResponse_(chunk[i], resp.getResponseCode(), resp.getContentText(), ts);
+      results[i] = adsDfsParseResponse_(chunk[i], resp.getResponseCode(), resp.getContentText(), adsDfsNow_());
       if (results[i].retry) stillPending.push(i);
     });
     pending = stillPending;
   }
+  return results;
+}
 
-  var rows = [];
-  results.forEach(function (r, i) {
-    if (!r) return;
-    if (r.retry) {   // out of retries
-      var ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
-      Logger.log('✗ "' + chunk[i] + '" (' + device + '): ' + r.reason);
-      rows.push([ts, chunk[i], '', '', r.reason, '', '', '']);
-    } else {
-      r.rows.forEach(function (row) { rows.push(row); });
-    }
+/**
+ * Pure function. Merges the looks for one keyword into sheet rows:
+ *   - every ad seen in any successful look (one row per ad type + advertiser, best position)
+ *   - otherwise 'No Ads Found' if every look succeeded
+ *   - otherwise an error row, so a failed look can never be read as 0 competitors
+ */
+function adsDfsCombine_(keyword, looks, device) {
+  var ok = looks.filter(function (r) { return r && !r.retry && !r.error; });
+  var best = {};
+  ok.forEach(function (r) {
+    r.rows.forEach(function (row) {
+      if (!row[2]) return;                                  // the 'No Ads Found' row
+      var key = row[2] + '|' + adsDfsHost_(row[5] || row[6]);
+      if (!best[key] || row[3] < best[key][3]) best[key] = row;
+    });
   });
-  return rows;
+  var ads = Object.keys(best).map(function (k) { return best[k]; });
+  if (ads.length) {
+    return ads.sort(function (a, b) {
+      return a[2] === b[2] ? a[3] - b[3] : (a[2] === 'top_ads' ? -1 : 1);
+    });
+  }
+  if (looks.length && ok.length === looks.length) {
+    return [ok[0].rows[0]];                                 // 'No Ads Found'
+  }
+  var failed = looks.filter(function (r) { return !r || r.retry || r.error; })[0] || {};
+  var reason = failed.retry ? failed.reason : (failed.rows ? failed.rows[0][4] : ADS_DFS_NET_ERR);
+  if (typeof Logger !== 'undefined') Logger.log('✗ "' + keyword + '" (' + device + '): ' + reason);
+  return [[adsDfsNow_(), keyword, '', '', reason || ADS_DFS_NET_ERR, '', '', '']];
+}
+
+/** Host of a URL or displayed link, lowercase, without www. */
+function adsDfsHost_(s) {
+  var m = String(s || '').trim().toLowerCase().match(/^(?:[a-z]+:\/\/)?([^\/\s›?#:]+)/);
+  return m ? m[1].replace(/^www\./, '') : '';
+}
+
+function adsDfsNow_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
 }
 
 /** One live task per request - DataForSEO allows only one task per live call. */
@@ -408,13 +455,38 @@ function adsDfsRequest_(keyword, device, headers) {
   };
 }
 
-/** Logs what the script would write for ADS_DFS.testKeyword on both devices. Writes nothing. */
+/**
+ * Diagnostic: looks at ADS_DFS.testKeyword exactly as a run would (samplesPerKeyword looks per
+ * device), logs what DataForSEO returned for each look, then the rows that would be written.
+ * Writes nothing.
+ */
 function testAdsDfsKeyword() {
   var headers = adsDfsHeaders_();
+  var kw = ADS_DFS.testKeyword;
+  Logger.log('Keyword: "' + kw + '" | location_code ' + ADS_DFS.locationCode);
   ['mobile', 'desktop'].forEach(function (device) {
-    var rows = adsDfsFetchChunk_([ADS_DFS.testKeyword], device, headers);
-    Logger.log('=== ' + ADS_DFS.testKeyword + ' | ' + device + ' | ' + rows.length + ' row(s)');
-    rows.forEach(function (r) { Logger.log(r.slice(2, 7).join(' | ')); });
+    var looks = [];
+    for (var n = 1; n <= ADS_DFS.samplesPerKeyword; n++) {
+      var resp = UrlFetchApp.fetchAll([adsDfsRequest_(kw, device, headers)])[0];
+      var body = resp.getContentText();
+      var info = '';
+      try {
+        var task = JSON.parse(body).tasks[0];
+        var res = task.result && task.result[0];
+        info = 'status ' + task.status_code + ' | types: ' + (res ? (res.item_types || []).join(',') : '-') +
+               ' | check_url: ' + (res ? res.check_url : '-');
+      } catch (e) { info = 'unparseable response: ' + body.slice(0, 200); }
+      var parsed = adsDfsParseResponse_(kw, resp.getResponseCode(), body, adsDfsNow_());
+      looks.push(parsed);
+      var ads = parsed.rows ? parsed.rows.filter(function (r) { return r[2]; }) : [];
+      Logger.log('--- ' + device + ' look ' + n + ': ' +
+                 (ads.length ? ads.map(function (r) { return adsDfsHost_(r[5]); }).join(', ')
+                             : (parsed.retry ? parsed.reason : parsed.rows[0][4])));
+      Logger.log('    ' + info);
+    }
+    var rows = adsDfsCombine_(kw, looks, device);
+    Logger.log('=== ' + device + ' WRITES ' + rows.length + ' row(s):');
+    rows.forEach(function (r) { Logger.log('    ' + r.slice(2, 6).join(' | ')); });
   });
 }
 
@@ -431,7 +503,7 @@ var ADS_DFS_RETRY_CODES = [40101, 40103, 40202, 40209];
  * at the top level and on each task.
  */
 function adsDfsParseResponse_(keyword, httpCode, bodyText, ts) {
-  var errRow = function (text) { return { rows: [[ts, keyword, '', '', text, '', '', '']] }; };
+  var errRow = function (text) { return { error: true, rows: [[ts, keyword, '', '', text, '', '', '']] }; };
 
   if (httpCode === 429) return { retry: true, reason: ADS_DFS_429 };
   if (httpCode >= 500)  return { retry: true, reason: 'HTTP ' + httpCode };
