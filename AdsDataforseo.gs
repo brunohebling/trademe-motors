@@ -11,7 +11,9 @@
  *   - each keyword is looked at samplesPerKeyword (3) times per device, a few seconds apart,
  *     because Google does not show ads on every page load. An ad seen in ANY look is written;
  *     'No Ads Found' only when every look succeeded and none had ads
- *   - batches of 25 keywords, mobile -> desktop, watchdog, retries and sheet lock
+ *   - batches of 25 keywords, mobile -> desktop, run back to back within each step; the only
+ *     pause is a short one when a step reaches its time limit and a new one has to start
+ *   - watchdog, retries and sheet lock
  *   - each step uses up to ~5m45s of Google's 6-minute limit; progress is saved after every
  *     5 keywords, and a stopped run can be continued with resumeAdsDfsNow()
  *
@@ -43,6 +45,8 @@ var ADS_DFS = {
                                 // A new round of calls only starts if the slowest round so far in
                                 // this step would still finish before then
   minCallMs          : 30000,   // a round of calls is assumed to take at least this long
+  stepGapSeconds     : 15,      // pause before the next step when a step runs out of time
+                                // (Google treats it as a minimum; steps usually start within ~1 min)
   fullAutomationHours: [7, 19], // 7am and 7pm (script time zone)
   maxRunHours        : 8,
   maxBatchRetries    : 2,
@@ -160,7 +164,7 @@ function startAdsDfsAutomation() {
   console.log('================ STARTING DFS ADS RUN ================');
 
   try {
-    ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(60 * 1000).create();
+    ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(ADS_DFS.stepGapSeconds * 1000).create();
   } catch (e) {
     props.setProperty('adsDfsRunning', 'false');
     props.setProperty('adsDfsStartupFailure', new Date().toISOString() + ': ' + e.message);
@@ -186,8 +190,8 @@ function resumeAdsDfsNow() {
   props.setProperty('adsDfsStartTime', new Date().toISOString());   // fresh 8h for the watchdog
   props.setProperty('adsDfsRetryCount', '0');
   deleteAdsDfsBatchTriggers_();
-  ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(60 * 1000).create();
-  console.log('Resuming in 1 minute: ' + (props.getProperty('adsDfsDevice') || 'mobile') + ' batch ' +
+  ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(ADS_DFS.stepGapSeconds * 1000).create();
+  console.log('Resuming shortly: ' + (props.getProperty('adsDfsDevice') || 'mobile') + ' batch ' +
               (parseInt(props.getProperty('adsDfsBatchIndex') || '0', 10) + 1) +
               ', keyword offset ' + (props.getProperty('adsDfsOffset') || '0'));
 }
@@ -213,15 +217,15 @@ function deleteAdsDfsBatchTriggers_() {
   });
 }
 
-function scheduleNextAdsDfs_(delayMinutes) {
+function scheduleNextAdsDfs_(delaySeconds) {
   deleteAdsDfsBatchTriggers_();
   try {
-    ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(delayMinutes * 60 * 1000).create();
+    ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(delaySeconds * 1000).create();
   } catch (e) {
     console.log('⚠️ Trigger creation failed: ' + e.message);
     Utilities.sleep(5000);
     try {
-      ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after((delayMinutes + 1) * 60 * 1000).create();
+      ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after((delaySeconds + 60) * 1000).create();
     } catch (e2) {
       PropertiesService.getScriptProperties().setProperty('adsDfsTriggerFailed', new Date().toISOString());
       console.log('✗ Trigger creation failed again: ' + e2.message);
@@ -246,58 +250,70 @@ function runAdsDfsAutomation() {
 
   // Safety net: if Google kills this execution before it finishes, this trigger resumes the
   // run from the last saved keyword. It is replaced by the normal trigger at the end.
-  scheduleNextAdsDfs_(7);
+  scheduleNextAdsDfs_(7 * 60);
 
-  var batches  = adsDfsBuildBatches_();
-  var device   = props.getProperty('adsDfsDevice') || 'mobile';
-  var batchIdx = parseInt(props.getProperty('adsDfsBatchIndex') || '0', 10);
-  var offset   = parseInt(props.getProperty('adsDfsOffset') || '0', 10);
-  console.log('Step start: ' + device + ' batch ' + (batchIdx + 1) + '/' + batches.length +
-              ', keyword offset ' + offset);
+  var batches = adsDfsBuildBatches_();
+  var clock = adsDfsClock_(executionStart.getTime());   // one time budget for every batch in this step
+  var firstInStep = true;
+  console.log('Step start');
 
-  if (batchIdx >= batches.length) {
-    console.log('✓ All DFS ads batches complete.');
-    props.setProperty('adsDfsRunning', 'false');
-    props.setProperty('adsDfsCompletedAt', new Date().toISOString());
-    deleteAdsDfsBatchTriggers_();
-    return;
-  }
+  // Batches run back to back until the run is done or this step is out of time
+  while (true) {
+    var device   = props.getProperty('adsDfsDevice') || 'mobile';
+    var batchIdx = parseInt(props.getProperty('adsDfsBatchIndex') || '0', 10);
+    var offset   = parseInt(props.getProperty('adsDfsOffset') || '0', 10);
 
-  var batch = batches[batchIdx];
-  console.log('DFS ' + device.toUpperCase() + ' batch ' + (batchIdx + 1) + '/' + batches.length +
-             ' (rows ' + batch.start + '-' + batch.end + ')');
-
-  var result;
-  try {
-    result = getAdsDfsBatch_(device, batch.start, batch.end, batchIdx === 0 && offset === 0, offset, executionStart);
-    props.setProperty('adsDfsRetryCount', '0');
-  } catch (e) {
-    var retryCount = parseInt(props.getProperty('adsDfsRetryCount') || '0', 10);
-    if (retryCount >= ADS_DFS.maxBatchRetries) {
-      console.log('✗ Batch ' + batchIdx + ' (' + device + ') failed ' + (retryCount + 1) + ' times (' + e.message + '). Skipping.');
-      props.setProperty('adsDfsLastBatch', device + '_' + batchIdx + '_skipped');
-      props.setProperty('adsDfsRetryCount', '0');
-      adsDfsAdvance_(props, device, batchIdx);
-      scheduleNextAdsDfs_(1);
+    if (batchIdx >= batches.length) {
+      console.log('✓ All DFS ads batches complete.');
+      props.setProperty('adsDfsRunning', 'false');
+      props.setProperty('adsDfsCompletedAt', new Date().toISOString());
+      deleteAdsDfsBatchTriggers_();
       return;
     }
-    console.log('⚠️ Batch error: ' + e.message + ' (retry ' + (retryCount + 1) + '/' + ADS_DFS.maxBatchRetries + ')');
-    props.setProperty('adsDfsRetryCount', String(retryCount + 1));
-    scheduleNextAdsDfs_(2);
-    return;
-  }
 
-  if (!result.complete) {
-    // Hit the time guard mid-batch: continue from where it stopped
-    props.setProperty('adsDfsOffset', String(result.nextOffset));
-    scheduleNextAdsDfs_(1);
-    return;
-  }
+    if (!firstInStep && !clock.canStart()) {
+      // No time left for another batch: the next step carries on after a short pause
+      scheduleNextAdsDfs_(ADS_DFS.stepGapSeconds);
+      return;
+    }
 
-  props.setProperty('adsDfsLastBatch', device + '_' + batchIdx + '_ok');
-  props.setProperty('adsDfsLastBatchTime', new Date().toISOString());
-  adsDfsAdvance_(props, device, batchIdx);
-  scheduleNextAdsDfs_(1);
+    var batch = batches[batchIdx];
+    console.log(device + ' batch ' + (batchIdx + 1) + '/' + batches.length +
+                ' (rows ' + batch.start + '-' + batch.end + '), keyword offset ' + offset);
+
+    var result;
+    try {
+      result = getAdsDfsBatch_(device, batch.start, batch.end, batchIdx === 0 && offset === 0, offset,
+                               executionStart, clock, firstInStep);
+      props.setProperty('adsDfsRetryCount', '0');
+    } catch (e) {
+      var retryCount = parseInt(props.getProperty('adsDfsRetryCount') || '0', 10);
+      if (retryCount >= ADS_DFS.maxBatchRetries) {
+        console.log('✗ Batch ' + batchIdx + ' (' + device + ') failed ' + (retryCount + 1) + ' times (' + e.message + '). Skipping.');
+        props.setProperty('adsDfsLastBatch', device + '_' + batchIdx + '_skipped');
+        props.setProperty('adsDfsRetryCount', '0');
+        adsDfsAdvance_(props, device, batchIdx);
+        scheduleNextAdsDfs_(ADS_DFS.stepGapSeconds);
+        return;
+      }
+      console.log('⚠️ Batch error: ' + e.message + ' (retry ' + (retryCount + 1) + '/' + ADS_DFS.maxBatchRetries + ')');
+      props.setProperty('adsDfsRetryCount', String(retryCount + 1));
+      scheduleNextAdsDfs_(2 * 60);
+      return;
+    }
+    firstInStep = false;
+
+    if (!result.complete) {
+      // Out of time mid-batch: the next step continues from where this one stopped
+      props.setProperty('adsDfsOffset', String(result.nextOffset));
+      scheduleNextAdsDfs_(ADS_DFS.stepGapSeconds);
+      return;
+    }
+
+    props.setProperty('adsDfsLastBatch', device + '_' + batchIdx + '_ok');
+    props.setProperty('adsDfsLastBatchTime', new Date().toISOString());
+    adsDfsAdvance_(props, device, batchIdx);
+  }
 }
 
 /** Batches of 50 rows, only as far as the keywords go. */
@@ -337,7 +353,7 @@ function adsDfsAdvance_(props, device, batchIdx) {
 // FETCH ONE BATCH
 // ==========================================================
 
-function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, executionStart) {
+function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, executionStart, clock, firstInStep) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var inputSheet = ss.getSheetByName(ADS_DFS.inputSheetName);
   if (!inputSheet) throw new Error('Input sheet not found: ' + ADS_DFS.inputSheetName);
@@ -352,13 +368,12 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
   var keywords = inputSheet.getRange(startRow, 1, endRow - startRow + 1, 1).getValues()
                            .map(function (r) { return String(r[0] || '').trim(); });
   var headers = adsDfsHeaders_();
-  var clock = adsDfsClock_(executionStart.getTime());
   var pos = offset;
 
   while (pos < keywords.length) {
     var chunk = keywords.slice(pos, pos + Math.max(1, ADS_DFS.parallelRequests));
     // The first group of every step always finishes, so a very slow API can't stall the run
-    var rows = adsDfsFetchChunk_(chunk, device, headers, clock, pos === offset);
+    var rows = adsDfsFetchChunk_(chunk, device, headers, clock, firstInStep && pos === offset);
     if (rows === null) {
       // Out of time part-way through this group: nothing written, the group is redone next step
       console.log('⏱ Time limit reached at keyword ' + pos + '/' + keywords.length + '. Continuing in the next step.');
