@@ -1,11 +1,13 @@
 /**
  * PAID ADS VIA DATAFORSEO - drop-in replacement for the Zenserp script (Multi Functions)
  *
- * Same job, same schedule, same output as Zenserp. Only the provider changes:
+ * Same job and schedule as Zenserp, written to DataForSEO tabs with the same 8 columns:
  *   - every keyword in 'Final keywords', mobile and desktop, Auckland, twice daily (7am / 7pm)
  *   - DataForSEO SERP live/advanced; every 'paid' item is one row, tagged top_ads / bottom_ads
+ *   - results go to AdsResultsDFSMobile / AdsResultsDFSDesktop (Combined Data reads these);
+ *     the old AdsResultsZen* tabs keep the last Zenserp results
  *   - same 8 columns and the same 'No Ads Found' / 'Network Error' / 'HTTP xxx' /
- *     'Rate Limited (429)' rows as Zenserp, so Combined Data needs no changes
+ *     'Rate Limited (429)' rows as Zenserp
  *     (DataForSEO account errors are written as 'API error <code>: <message>')
  *   - one keyword per API call (as DataForSEO requires for live calls)
  *   - each keyword is looked at samplesPerKeyword (3) times per device, a few seconds apart,
@@ -21,11 +23,10 @@
  * the rows the script would write. Writes nothing.
  *
  * HOW TO USE
- *   LIVE (current): outputSheets = the Zen tabs, so Combined Data reads these results.
- *     One-off setup: stopAdsDfsAutomation(), removeLegacyZenserpTriggers(), setupAdsDfsSchedule().
- *     After that it runs by itself at 7am and 7pm; the hourly watchdog continues a stalled run.
- *   Test without touching live data: set outputSheets to the DFS tabs, run startAdsDfsNow(),
- *     then compareAdsParity().
+ *   One-off setup: stopAdsDfsAutomation(), removeLegacyZenserpTriggers(), setupAdsDfsSchedule().
+ *   After that it runs by itself at 7am and 7pm; the hourly watchdog continues a stalled run.
+ *   startAdsDfsNow() runs it straight away. compareAdsParity() compares the DFS tabs with the
+ *   last Zenserp results in the AdsResultsZen* tabs.
  *
  * CREDENTIALS: Script Properties DFS_LOGIN / DFS_PASSWORD if set, otherwise config.gs.
  */
@@ -57,8 +58,8 @@ var ADS_DFS = {
   lockTimeoutMs      : 30000,
   rate429DelayMs     : 5000,
 
-  // LIVE: Combined Data reads these tabs. For a test run use 'AdsResultsDFSMobile' / 'AdsResultsDFSDesktop'
-  outputSheets: { mobile: 'AdsResultsZenMobile', desktop: 'AdsResultsZenDesktop' },
+  // Combined Data reads these tabs
+  outputSheets: { mobile: 'AdsResultsDFSMobile', desktop: 'AdsResultsDFSDesktop' },
 
   costPerLiveCallUsd : 0.002,   // measured on this account, 2026-09-30
 
