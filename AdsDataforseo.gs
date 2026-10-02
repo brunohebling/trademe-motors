@@ -15,6 +15,8 @@
  *     'No Ads Found' only when every look succeeded and none had ads
  *   - batches of 25 keywords, mobile -> desktop, run back to back within each step; the only
  *     pause is a short one when a step reaches its time limit and a new one has to start
+ *   - the keyword list is copied to a hidden 'DFS run keywords' tab when a run starts, so a
+ *     refresh of Final keywords mid-run doesn't change which keywords the run checks
  *   - watchdog, retries and sheet lock
  *   - each step uses up to ~5m45s of Google's 6-minute limit; progress is saved after every
  *     5 keywords, and a stopped run can be continued with resumeAdsDfsNow()
@@ -162,6 +164,11 @@ function startAdsDfsAutomation() {
     }
     console.log('⚠️ Stale DFS ads run. Auto-recovering.');
     deleteAdsDfsBatchTriggers_();
+  }
+
+  if (adsDfsTakeSnapshot_() === 0) {
+    console.log('✗ No keywords in ' + ADS_DFS.inputSheetName + '. Run not started.');
+    return;
   }
 
   props.setProperty('adsDfsRunning', 'true');
@@ -352,9 +359,47 @@ function runAdsDfsAutomation() {
   }
 }
 
-/** Batches of 50 rows, only as far as the keywords go. */
+// ==========================================================
+// KEYWORD SNAPSHOT
+// 'Final keywords' is a formula that changes size and order whenever Ads Keyword Metrics
+// refreshes. Each run copies the list once when it starts and works from that copy, so a
+// refresh mid-run can't end the run early or make it skip or repeat keywords.
+// ==========================================================
+
+var ADS_DFS_SNAPSHOT = 'DFS run keywords';
+
+/** Copies the keywords from Final keywords into the (hidden) snapshot tab. Returns the count. */
+function adsDfsTakeSnapshot_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var src = ss.getSheetByName(ADS_DFS.inputSheetName);
+  if (!src) throw new Error('Input sheet not found: ' + ADS_DFS.inputSheetName);
+  var last = Math.min(ADS_DFS.lastRow, adsDfsLastRow_(src));
+  var kws = last < ADS_DFS.firstRow ? [] :
+    src.getRange(ADS_DFS.firstRow, 1, last - ADS_DFS.firstRow + 1, 1).getValues()
+       .map(function (r) { return String(r[0] || '').trim(); })
+       .filter(String)
+       .map(function (k) { return [k]; });
+  var snap = ss.getSheetByName(ADS_DFS_SNAPSHOT) || ss.insertSheet(ADS_DFS_SNAPSHOT);
+  snap.clear();
+  snap.getRange(1, 1, kws.length + 1, 1).setValues([['Keyword']].concat(kws));
+  if (!snap.isSheetHidden()) snap.hideSheet();
+  console.log('Keyword snapshot: ' + kws.length + ' keywords copied from ' + ADS_DFS.inputSheetName);
+  return kws.length;
+}
+
+/** The snapshot tab for the current run (taken now if it doesn't exist yet). */
+function adsDfsKeywordSheet_() {
+  var snap = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ADS_DFS_SNAPSHOT);
+  if (!snap || snap.getLastRow() < ADS_DFS.firstRow) {
+    adsDfsTakeSnapshot_();
+    snap = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ADS_DFS_SNAPSHOT);
+  }
+  return snap;
+}
+
+/** Batches of batchSize rows of this run's keyword snapshot. */
 function adsDfsBuildBatches_() {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(ADS_DFS.inputSheetName);
+  var sheet = adsDfsKeywordSheet_();
   var last = Math.min(ADS_DFS.lastRow, adsDfsLastRow_(sheet));
   var batches = [];
   for (var s = ADS_DFS.firstRow; s <= last; s += ADS_DFS.batchSize) {
@@ -391,8 +436,7 @@ function adsDfsAdvance_(props, device, batchIdx) {
 
 function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, executionStart, clock, firstInStep) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var inputSheet = ss.getSheetByName(ADS_DFS.inputSheetName);
-  if (!inputSheet) throw new Error('Input sheet not found: ' + ADS_DFS.inputSheetName);
+  var inputSheet = adsDfsKeywordSheet_();
 
   var outName = ADS_DFS.outputSheets[device];
   var outSheet = ss.getSheetByName(outName) || ss.insertSheet(outName);
