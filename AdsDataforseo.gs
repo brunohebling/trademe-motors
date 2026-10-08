@@ -17,6 +17,12 @@
  *     pause is a short one when a step reaches its time limit and a new one has to start
  *   - the keyword list is copied to a hidden 'DFS run keywords' tab when a run starts, so a
  *     refresh of Final keywords mid-run doesn't change which keywords the run checks
+ *   - results are written to hidden 'DFS working - <tab>' tabs and copied to the tabs Combined Data
+ *     reads only when a run has finished and passed its checks (every keyword has rows, at most
+ *     maxErrorShare of them errors). A failed or half-finished run never leaves keywords blank:
+ *     Combined Data keeps the previous complete results
+ *   - emails an alert (Script Property ALERT_EMAILS) when something needs attention, plus one
+ *     short summary a day
  *   - watchdog, retries and sheet lock
  *   - each step uses up to ~5m45s of Google's 6-minute limit; progress is saved after every
  *     5 keywords, and a stopped run can be continued with resumeAdsDfsNow()
@@ -26,6 +32,8 @@
  *
  * HOW TO USE
  *   One-off setup: stopAdsDfsAutomation(), removeLegacyZenserpTriggers(), setupAdsDfsSchedule().
+ *   Alerts: set Script Property ALERT_EMAILS (comma-separated addresses), then run testAdsDfsAlert()
+ *   once, signed in as the account that owns the triggers, to approve sending email.
  *   After that it runs by itself at 7am and 7pm; the hourly watchdog continues a stalled run.
  *   startAdsDfsNow() runs it straight away. compareAdsParity() compares the DFS tabs with the
  *   last Zenserp results in the AdsResultsZen* tabs.
@@ -65,6 +73,13 @@ var ADS_DFS = {
 
   // Combined Data reads these tabs
   outputSheets: { mobile: 'AdsResultsDFSMobile', desktop: 'AdsResultsDFSDesktop' },
+
+  maxErrorShare      : 0.2,     // a finished run replaces the live tabs only if at most this share of its
+                                // keywords came back as errors on each device; otherwise the previous
+                                // complete results stay and an alert is emailed
+  alertEveryHours    : 6,       // the same alert is emailed at most once per this many hours
+  projectName        : 'Motors',
+  runbookUrl         : 'https://claude.ai/code/artifact/5dcb3463-b9b6-4604-b479-6433fd262004',
 
   costPerLiveCallUsd : 0.002,   // measured on this account, 2026-09-30
 
@@ -190,6 +205,9 @@ function startAdsDfsAutomation() {
   } catch (e) {
     props.setProperty('adsDfsRunning', 'false');
     props.setProperty('adsDfsStartupFailure', new Date().toISOString() + ': ' + e.message);
+    adsDfsAlert_('startup', 'The ads run could not start',
+                 'Google refused to schedule the first step: ' + e.message + '\n\nThe next scheduled run will try again. ' +
+                 'To run it now, use startAdsDfsNow().');
     throw e;
   }
 }
@@ -219,10 +237,15 @@ function resumeAdsDfsNow() {
               ', keyword offset ' + (props.getProperty('adsDfsOffset') || '0'));
 }
 
-/** Hourly watchdog: clears a run stuck for more than maxRunHours and continues a stalled one. */
+/**
+ * Hourly watchdog: clears a run stuck for more than maxRunHours, continues a stalled one, emails
+ * an alert when there have been no new results for too long, and checks the daily triggers.
+ */
 function checkAdsDfsAbandonedFlags() {
   adsDfsClearStuckRun_();
   adsDfsResumeIfStalled_();
+  adsDfsCheckOverdue_();
+  adsDfsCheckSchedule_();
 }
 
 /**
@@ -242,6 +265,9 @@ function adsDfsResumeIfStalled_() {
   console.log('⚠️ [WATCHDOG] Run stalled (no progress since ' + last.toISOString() + '). Continuing it.');
   props.setProperty('adsDfsWatchdogResumed', new Date().toISOString());
   scheduleNextAdsDfs_(ADS_DFS.stepGapSeconds);   // also deletes any leftover step trigger
+  adsDfsAlert_('resumed', 'The ads run had stalled and was restarted automatically',
+               'No progress since ' + adsDfsFmt_(last) + '. The watchdog has continued the run from where it ' +
+               'stopped. No action needed unless this keeps happening.');
 }
 
 /** Clears the running flag of a run that has gone on for more than maxRunHours. */
@@ -257,6 +283,10 @@ function adsDfsClearStuckRun_() {
     props.setProperty('adsDfsRunning', 'false');
     props.setProperty('adsDfsStoppedReason', 'watchdog_' + new Date().toISOString());
     deleteAdsDfsBatchTriggers_();
+    adsDfsAlert_('cancelled', 'The ads run was cancelled after ' + ADS_DFS.maxRunHours + ' hours',
+                 'The run started ' + (startDate && !isNaN(startDate.getTime()) ? adsDfsFmt_(startDate) : '(unknown)') +
+                 ' and did not finish. Its results were NOT copied to the live tabs, so Combined Data still uses ' +
+                 'the previous complete results. The next scheduled run will try again; to run it now, use startAdsDfsNow().');
   }
 }
 
@@ -266,20 +296,32 @@ function deleteAdsDfsBatchTriggers_() {
   });
 }
 
+/**
+ * Schedules the next step, then removes every other step trigger (used one-off triggers and
+ * older backups). The new trigger is created first, so a Google error in between can't leave the
+ * run with no trigger at all.
+ */
 function scheduleNextAdsDfs_(delaySeconds) {
-  deleteAdsDfsBatchTriggers_();
-  try {
-    ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(delaySeconds * 1000).create();
-  } catch (e) {
-    console.log('⚠️ Trigger creation failed: ' + e.message);
-    Utilities.sleep(5000);
+  var created = null;
+  for (var attempt = 0; attempt < 2 && !created; attempt++) {
     try {
-      ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after((delaySeconds + 60) * 1000).create();
-    } catch (e2) {
-      PropertiesService.getScriptProperties().setProperty('adsDfsTriggerFailed', new Date().toISOString());
-      console.log('✗ Trigger creation failed again: ' + e2.message);
+      created = ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after((delaySeconds + attempt * 60) * 1000).create();
+    } catch (e) {
+      console.log('⚠️ Trigger creation failed: ' + e.message);
+      if (attempt === 0) Utilities.sleep(5000);
     }
   }
+  if (!created) {
+    PropertiesService.getScriptProperties().setProperty('adsDfsTriggerFailed', new Date().toISOString());
+    console.log('✗ Trigger creation failed twice. The hourly watchdog will continue the run.');
+    adsDfsAlert_('trigger', 'Google could not schedule the next step of the ads run',
+                 'The hourly watchdog will continue the run within about an hour. No action needed unless this keeps happening.');
+    return;
+  }
+  var keep = created.getUniqueId();
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === ADS_DFS_HANDLER && t.getUniqueId() !== keep) ScriptApp.deleteTrigger(t);
+  });
 }
 
 
@@ -314,10 +356,29 @@ function runAdsDfsAutomation() {
     var offset   = parseInt(props.getProperty('adsDfsOffset') || '0', 10);
 
     if (batchIdx >= batches.length) {
-      console.log('✓ All DFS ads batches complete.');
+      // Every batch is done: check the results and copy them to the tabs Combined Data reads
+      var pub;
+      try {
+        pub = adsDfsPublish_();
+      } catch (e) {
+        console.log('✗ Could not copy the results to the live tabs: ' + e.message + '. Trying again in 2 minutes.');
+        adsDfsAlert_('publish', 'Results could not be copied to the live tabs yet',
+                     'Error: ' + e.message + '\n\nThe script tries again every couple of minutes. Combined Data keeps the ' +
+                     'previous complete results meanwhile.');
+        scheduleNextAdsDfs_(2 * 60);
+        return;
+      }
+      console.log('✓ All DFS ads batches complete' + (pub.published ? ' and copied to the live tabs.' : '. NOT copied: ' + pub.reason));
       props.setProperty('adsDfsRunning', 'false');
       props.setProperty('adsDfsCompletedAt', new Date().toISOString());
+      if (pub.published) {
+        props.setProperty('adsDfsPublishedAt', new Date().toISOString());
+        props.deleteProperty('adsDfsNotPublished');
+      } else {
+        props.setProperty('adsDfsNotPublished', new Date().toISOString() + ': ' + pub.reason);
+      }
       deleteAdsDfsBatchTriggers_();
+      if (pub.published) adsDfsSendSummary_(pub);
       return;
     }
 
@@ -337,9 +398,26 @@ function runAdsDfsAutomation() {
                                executionStart, clock, firstInStep);
       props.setProperty('adsDfsRetryCount', '0');
     } catch (e) {
+      var msg = String((e && e.message) || e);
+      if (/sheet lock/i.test(msg)) {
+        // Another execution is writing to the sheet. Not this batch's fault, so try the same batch
+        // again without counting it as a failure (a skipped batch would leave keywords without rows)
+        console.log('⚠️ Sheet busy (' + msg + '). Trying the same batch again in 1 minute.');
+        scheduleNextAdsDfs_(60);
+        return;
+      }
       var retryCount = parseInt(props.getProperty('adsDfsRetryCount') || '0', 10);
       if (retryCount >= ADS_DFS.maxBatchRetries) {
-        console.log('✗ Batch ' + batchIdx + ' (' + device + ') failed ' + (retryCount + 1) + ' times (' + e.message + '). Skipping.');
+        // Give up on this batch, but write an error row for every keyword it didn't finish, so no
+        // keyword is left without rows (the publish check counts these rows as errors)
+        var done = parseInt(props.getProperty('adsDfsOffset') || '0', 10);
+        var n = adsDfsWriteSkippedRows_(device, batch, done, msg);
+        console.log('✗ Batch ' + batchIdx + ' (' + device + ') failed ' + (retryCount + 1) + ' times (' + msg + '). ' +
+                    n + ' keyword(s) written as skipped.');
+        adsDfsAlert_('skipped', 'A batch of keywords failed and was skipped',
+                     n + ' ' + device + ' keyword(s) in rows ' + batch.start + '-' + batch.end + ' were written as ' +
+                     '"Skipped" after 3 failed tries. Error: ' + msg + '\n\nThe rest of the run continues. If too many ' +
+                     'keywords end up skipped, the run is not copied to the live tabs and you get another email.');
         props.setProperty('adsDfsLastBatch', device + '_' + batchIdx + '_skipped');
         props.setProperty('adsDfsRetryCount', '0');
         adsDfsAdvance_(props, device, batchIdx);
@@ -445,8 +523,7 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var inputSheet = adsDfsKeywordSheet_();
 
-  var outName = ADS_DFS.outputSheets[device];
-  var outSheet = ss.getSheetByName(outName) || ss.insertSheet(outName);
+  var outSheet = adsDfsWorkSheet_(device);   // copied to the live tab when the run finishes
   var lock = LockService.getScriptLock();
   var props = PropertiesService.getScriptProperties();
 
@@ -467,6 +544,7 @@ function getAdsDfsBatch_(device, startRow, endRow, clearSheet, offset, execution
       return { complete: false, nextOffset: pos };
     }
     if (rows.length) adsDfsWrite_(lock, outSheet, rows, false);
+    adsDfsCheckAccountErrors_(rows);
     pos += chunk.length;
     props.setProperty('adsDfsOffset', String(pos));   // progress survives a killed execution
     props.setProperty('adsDfsLastProgress', new Date().toISOString());
@@ -741,6 +819,235 @@ function adsDfsWrite_(lock, sheet, rows, clear) {
 
 
 // ==========================================================
+// PUBLISHING: working tabs -> the tabs Combined Data reads
+// A run writes to hidden working tabs. Only when every batch is done, and the results pass the
+// checks below, are they copied over the live tabs in one go. A run that fails, stalls or is
+// cancelled therefore never leaves keywords blank: Combined Data keeps the previous results.
+// ==========================================================
+
+function adsDfsWorkName_(liveName) { return 'DFS working - ' + liveName; }
+
+/** The hidden working tab for one device (created and hidden if missing). */
+function adsDfsWorkSheet_(device) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var name = adsDfsWorkName_(ADS_DFS.outputSheets[device]);
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.hideSheet();
+  }
+  return sheet;
+}
+
+/** The keywords of the current run (its snapshot), in order. */
+function adsDfsRunKeywords_() {
+  var snap = adsDfsKeywordSheet_();
+  var last = adsDfsLastRow_(snap);
+  if (last < ADS_DFS.firstRow) return [];
+  return snap.getRange(ADS_DFS.firstRow, 1, last - ADS_DFS.firstRow + 1, 1).getValues()
+             .map(function (r) { return String(r[0] || '').trim(); }).filter(String);
+}
+
+/**
+ * Checks the finished run in the working tabs and, if it passes, copies it over the live tabs.
+ * Checks (per device): every keyword of the run has at least one row, and at most maxErrorShare
+ * of the keywords came back as errors. Returns {published, reason, stats}.
+ */
+function adsDfsPublish_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var kws = adsDfsRunKeywords_();
+  var problems = [], data = {}, stats = { keywords: kws.length };
+
+  ['mobile', 'desktop'].forEach(function (device) {
+    var work = adsDfsWorkSheet_(device);
+    var rows = work.getLastRow() > 0 ? work.getRange(1, 1, work.getLastRow(), 8).getValues() : [];
+    var seen = {}, errors = {}, competitors = {};
+    rows.slice(1).forEach(function (r) {
+      var kw = String(r[1] || '').trim();
+      if (!kw) return;
+      seen[kw] = true;
+      if (!r[2]) {
+        if (r[4] !== ADS_DFS_NO_ADS) errors[kw] = true;
+      } else if (!/trademe\.co\.nz/i.test(String(r[5]) + ' ' + String(r[6]))) {
+        competitors[kw] = true;
+      }
+    });
+    var missing = kws.filter(function (kw) { return !seen[kw]; });
+    var errCount = Object.keys(errors).length;
+    if (missing.length) {
+      problems.push(device + ': ' + missing.length + ' keyword(s) have no rows (e.g. ' + missing.slice(0, 5).join(', ') + ')');
+    }
+    if (kws.length && errCount / kws.length > ADS_DFS.maxErrorShare) {
+      problems.push(device + ': ' + errCount + ' of ' + kws.length + ' keywords came back as errors');
+    }
+    data[device] = rows;
+    stats[device] = { competitors: Object.keys(competitors).length, errors: errCount, rows: Math.max(0, rows.length - 1) };
+  });
+
+  if (problems.length) {
+    var reason = problems.join('; ');
+    adsDfsAlert_('notpublished', 'The ads run finished but was NOT copied to the live tabs',
+                 'The run finished, but its results failed the checks:\n  - ' + problems.join('\n  - ') +
+                 '\n\nCombined Data keeps the previous complete results. The next scheduled run will try again. ' +
+                 'If the errors say "API error 40200 / 40203 / 40210", the DataForSEO balance or daily cap ran out.');
+    return { published: false, reason: reason, stats: stats };
+  }
+
+  var lock = LockService.getScriptLock();
+  ['mobile', 'desktop'].forEach(function (device) {
+    adsDfsReplaceSheet_(lock, ss, ADS_DFS.outputSheets[device], data[device]);
+  });
+  return { published: true, reason: '', stats: stats };
+}
+
+/** Overwrites a live tab with new rows in one go (no moment where it is empty), then clears leftovers. */
+function adsDfsReplaceSheet_(lock, ss, name, rows) {
+  var sheet = ss.getSheetByName(name) || ss.insertSheet(name);
+  if (!lock.tryLock(ADS_DFS.lockTimeoutMs)) throw new Error('Could not acquire sheet lock to update ' + name);
+  try {
+    var oldRows = sheet.getLastRow();
+    if (rows.length) sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+    if (oldRows > rows.length) {
+      sheet.getRange(rows.length + 1, 1, oldRows - rows.length, Math.max(sheet.getLastColumn(), 8)).clearContent();
+    }
+    SpreadsheetApp.flush();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Writes a 'Skipped' error row for each keyword of a batch from `fromOffset` on. Returns the count. */
+function adsDfsWriteSkippedRows_(device, batch, fromOffset, reason) {
+  try {
+    var kws = adsDfsKeywordSheet_().getRange(batch.start, 1, batch.end - batch.start + 1, 1).getValues()
+                .map(function (r) { return String(r[0] || '').trim(); });
+    var ts = adsDfsNow_();
+    var rows = kws.slice(fromOffset).filter(String).map(function (kw) {
+      return [ts, kw, '', '', 'Skipped: ' + String(reason).slice(0, 100), '', '', ''];
+    });
+    if (rows.length) adsDfsWrite_(LockService.getScriptLock(), adsDfsWorkSheet_(device), rows, false);
+    return rows.length;
+  } catch (e) {
+    // The publish check will notice these keywords have no rows and keep the previous results
+    console.log('Could not write the skipped rows: ' + e.message);
+    return 0;
+  }
+}
+
+
+// ==========================================================
+// ALERTS (email)
+// Recipients: Script Property ALERT_EMAILS (comma-separated). Without it, the Google account
+// that runs the triggers. The same alert is sent at most once per alertEveryHours.
+// ==========================================================
+
+// DataForSEO errors that mean the account itself has a problem: bad login, verification needed,
+// no balance, account paused, daily cost limit reached
+var ADS_DFS_ACCOUNT_ERRORS = /^API error (40100|40104|40200|40201|40203|40210)\b/;
+
+function adsDfsAlertRecipients_() {
+  var to = PropertiesService.getScriptProperties().getProperty('ALERT_EMAILS');
+  if (to && to.trim()) return to.trim();
+  try { return Session.getEffectiveUser().getEmail() || '(none - set Script Property ALERT_EMAILS)'; }
+  catch (e) { return '(none - set Script Property ALERT_EMAILS)'; }
+}
+
+function adsDfsFmt_(d) {
+  return Utilities.formatDate(new Date(d), Session.getScriptTimeZone(), 'EEE d MMM, HH:mm');
+}
+
+/** Emails an alert, at most once per `everyHours` (default alertEveryHours) for the same key. Never throws. */
+function adsDfsAlert_(key, subject, body, everyHours) {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var pk = 'adsDfs_alert_' + key;
+    var last = Number(props.getProperty(pk) || 0);
+    if (Date.now() - last < (everyHours || ADS_DFS.alertEveryHours) * 3600000) {
+      console.log('(alert already sent recently, not repeated) ' + subject);
+      return;
+    }
+    var to = adsDfsAlertRecipients_();
+    if (to.indexOf('@') === -1) { console.log('⚠️ No alert recipient: ' + subject); return; }
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    MailApp.sendEmail(to, '[One Search ' + ADS_DFS.projectName + '] ' + subject,
+      body + '\n\n--\nSpreadsheet: ' + ss.getName() + '\n' + ss.getUrl() +
+      '\nFor details, run checkAdsDfsStatus() in Extensions > Apps Script.' +
+      '\nRunbook: ' + ADS_DFS.runbookUrl);
+    props.setProperty(pk, String(Date.now()));
+    console.log('✉ Alert sent to ' + to + ': ' + subject);
+  } catch (e) {
+    console.log('⚠️ Could not send alert email (' + e.message + '): ' + subject);
+  }
+}
+
+/** Alerts once if any row in this batch shows a DataForSEO account problem. */
+function adsDfsCheckAccountErrors_(rows) {
+  for (var i = 0; i < rows.length; i++) {
+    var text = String(rows[i][4] || '');
+    if (ADS_DFS_ACCOUNT_ERRORS.test(text)) {
+      adsDfsAlert_('account', 'DataForSEO account problem: ' + text.slice(0, 120),
+                   'DataForSEO is refusing the checks: ' + text + '\n\nUntil it is fixed every keyword comes back as ' +
+                   'an error, so the results are not copied to the live tabs (Combined Data keeps the previous ' +
+                   'results). Check the balance and the daily cost limit at https://app.dataforseo.com/');
+      return;
+    }
+  }
+}
+
+/** Emails an alert when there have been no new live results for longer than the schedule allows. */
+function adsDfsCheckOverdue_() {
+  var props = PropertiesService.getScriptProperties();
+  var hrs = ADS_DFS.fullAutomationHours.slice().sort(function (a, b) { return a - b; });
+  var maxGap = 0;
+  for (var i = 0; i < hrs.length; i++) {
+    var next = i + 1 < hrs.length ? hrs[i + 1] : hrs[0] + 24;
+    maxGap = Math.max(maxGap, next - hrs[i]);
+  }
+  var limitHours = maxGap + ADS_DFS.maxRunHours + 1;
+  var since = props.getProperty('adsDfsPublishedAt') || props.getProperty('adsDfsWatchSince');
+  if (!since) {   // first check after this version was installed: start counting from now
+    props.setProperty('adsDfsWatchSince', new Date().toISOString());
+    return;
+  }
+  var hours = (new Date() - new Date(since)) / 3600000;
+  if (hours > limitHours) {
+    adsDfsAlert_('overdue', 'No new ads results for ' + Math.round(hours) + ' hours',
+                 'The live tabs (' + ADS_DFS.outputSheets.mobile + ' / ' + ADS_DFS.outputSheets.desktop + ') were last ' +
+                 'updated ' + adsDfsFmt_(since) + '. Combined Data is using results that old.\n\nRun checkAdsDfsStatus() ' +
+                 'to see why, then follow the runbook.');
+  }
+}
+
+/** Emails an alert if the daily start triggers are missing or doubled. */
+function adsDfsCheckSchedule_() {
+  var n = ScriptApp.getProjectTriggers().filter(function (t) { return t.getHandlerFunction() === ADS_DFS_STARTER; }).length;
+  if (n !== ADS_DFS.fullAutomationHours.length) {
+    adsDfsAlert_('schedule', 'The daily schedule has changed',
+                 n + ' daily start trigger(s) found, expected ' + ADS_DFS.fullAutomationHours.length +
+                 '.\n\nTo restore it, run setupAdsDfsSchedule() once.');
+  }
+}
+
+/** One short email a day after a run is copied to the live tabs. */
+function adsDfsSendSummary_(pub) {
+  var st = pub.stats;
+  adsDfsAlert_('summary', 'Daily summary: ads run OK',
+    'The ads run finished and was copied to the live tabs at ' + adsDfsFmt_(new Date()) + '.\n\n' +
+    'Keywords checked: ' + st.keywords + '\n' +
+    'Mobile: ' + st.mobile.competitors + ' keywords with competitor ads, ' + st.mobile.errors + ' errors\n' +
+    'Desktop: ' + st.desktop.competitors + ' keywords with competitor ads, ' + st.desktop.errors + ' errors\n\n' +
+    'No action needed. If this email stops arriving, something is wrong: follow the runbook.', 20);
+}
+
+/** Sends a test alert now (ignores the once-per-hours limit). Run once to approve sending email. */
+function testAdsDfsAlert() {
+  PropertiesService.getScriptProperties().deleteProperty('adsDfs_alert_test');
+  adsDfsAlert_('test', 'Test alert', 'This is a test. Alerts from the paid-ads check will arrive like this.');
+  console.log('Recipients: ' + adsDfsAlertRecipients_());
+}
+
+
+// ==========================================================
 // TEST ONLY: compare the DFS tabs with the Zen tabs
 // ==========================================================
 
@@ -803,10 +1110,12 @@ function adsDfsCount_(sheet) {
 function checkAdsDfsStatus() {
   var props = PropertiesService.getScriptProperties();
   console.log('================ DFS ADS STATUS ================');
+  console.log('Alert emails go to: ' + adsDfsAlertRecipients_());
   console.log('Running: ' + (props.getProperty('adsDfsRunning') === 'true' ? 'YES' : 'NO'));
   console.log('Output tabs: ' + ADS_DFS.outputSheets.mobile + ' / ' + ADS_DFS.outputSheets.desktop);
   ['adsDfsDevice', 'adsDfsBatchIndex', 'adsDfsOffset', 'adsDfsStartTime', 'adsDfsLastProgress', 'adsDfsLastBatch', 'adsDfsLastBatchTime',
-   'adsDfsCompletedAt', 'adsDfsStoppedReason', 'adsDfsStartupFailure', 'adsDfsTriggerFailed', 'adsDfsWatchdogResumed']
+   'adsDfsCompletedAt', 'adsDfsPublishedAt', 'adsDfsNotPublished', 'adsDfsStoppedReason', 'adsDfsStartupFailure',
+   'adsDfsTriggerFailed', 'adsDfsWatchdogResumed']
     .forEach(function (k) {
       var v = props.getProperty(k);
       if (v) console.log(k + ': ' + v);
