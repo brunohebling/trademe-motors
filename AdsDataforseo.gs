@@ -55,6 +55,9 @@ var ADS_DFS = {
                                 // (Google treats it as a minimum; steps usually start within ~1 min)
   fullAutomationHours: [7, 19], // 7am and 7pm (script time zone)
   maxRunHours        : 8,
+  stallMinutes       : 40,      // watchdog continues a run with no progress for this long. Longer than
+                                // the longest execution seen (32 min on 9 Oct 2026), so it never starts
+                                // a step while a hung one could still be alive
   maxBatchRetries    : 2,
   maxRequestRetries  : 2,       // in-batch retries for a failed keyword
   lockTimeoutMs      : 30000,
@@ -223,18 +226,22 @@ function checkAdsDfsAbandonedFlags() {
 }
 
 /**
- * A run is stalled when it is marked running but no next step is scheduled and nothing has
- * happened for 15 minutes (e.g. Google killed a step and the backup trigger was lost).
- * The watchdog then continues it from where it got to, keeping the rows already written.
+ * A run is stalled when it is marked running but has made no progress for stallMinutes.
+ * Progress is saved at the start of every step and after every group of keywords, so a healthy
+ * run never goes that long without it. A leftover trigger does not count as "next step
+ * scheduled": on 9 Oct 2026 a step hung inside Google's trigger service for 32 minutes and left
+ * a used one-off trigger behind, and the old check (which trusted that trigger) never resumed the
+ * run. The watchdog now removes any leftover step trigger and continues the run from where it
+ * got to, keeping the rows already written.
  */
 function adsDfsResumeIfStalled_() {
   var props = PropertiesService.getScriptProperties();
   if (props.getProperty('adsDfsRunning') !== 'true') return;
-  var waiting = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === ADS_DFS_HANDLER; });
   var last = new Date(props.getProperty('adsDfsLastProgress') || props.getProperty('adsDfsStartTime') || '');
-  if (waiting || isNaN(last.getTime()) || new Date() - last < 15 * 60 * 1000) return;
-  console.log('⚠️ [WATCHDOG] Run stalled (nothing scheduled, no progress since ' + last.toISOString() + '). Continuing it.');
-  ScriptApp.newTrigger(ADS_DFS_HANDLER).timeBased().after(ADS_DFS.stepGapSeconds * 1000).create();
+  if (isNaN(last.getTime()) || new Date() - last < ADS_DFS.stallMinutes * 60 * 1000) return;
+  console.log('⚠️ [WATCHDOG] Run stalled (no progress since ' + last.toISOString() + '). Continuing it.');
+  props.setProperty('adsDfsWatchdogResumed', new Date().toISOString());
+  scheduleNextAdsDfs_(ADS_DFS.stepGapSeconds);   // also deletes any leftover step trigger
 }
 
 /** Clears the running flag of a run that has gone on for more than maxRunHours. */
@@ -799,16 +806,21 @@ function checkAdsDfsStatus() {
   console.log('Running: ' + (props.getProperty('adsDfsRunning') === 'true' ? 'YES' : 'NO'));
   console.log('Output tabs: ' + ADS_DFS.outputSheets.mobile + ' / ' + ADS_DFS.outputSheets.desktop);
   ['adsDfsDevice', 'adsDfsBatchIndex', 'adsDfsOffset', 'adsDfsStartTime', 'adsDfsLastProgress', 'adsDfsLastBatch', 'adsDfsLastBatchTime',
-   'adsDfsCompletedAt', 'adsDfsStoppedReason', 'adsDfsStartupFailure', 'adsDfsTriggerFailed']
+   'adsDfsCompletedAt', 'adsDfsStoppedReason', 'adsDfsStartupFailure', 'adsDfsTriggerFailed', 'adsDfsWatchdogResumed']
     .forEach(function (k) {
       var v = props.getProperty(k);
       if (v) console.log(k + ': ' + v);
     });
   var handlers = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
   var waiting = handlers.filter(function (h) { return h === ADS_DFS_HANDLER; }).length;
-  console.log('Next step scheduled: ' + (waiting ? 'yes' : 'NO') +
-              (props.getProperty('adsDfsRunning') === 'true' && !waiting
-                ? '  <- run is stalled: the hourly watchdog will continue it, or run resumeAdsDfsNow()' : ''));
+  console.log('Step trigger present: ' + (waiting ? 'yes' : 'no'));
+  if (props.getProperty('adsDfsRunning') === 'true') {
+    var last = new Date(props.getProperty('adsDfsLastProgress') || '');
+    var mins = isNaN(last.getTime()) ? null : Math.round((new Date() - last) / 60000);
+    console.log('Last progress: ' + (mins === null ? 'unknown' : mins + ' min ago') +
+      (mins === null || mins >= ADS_DFS.stallMinutes
+        ? '  <- run is stalled: the hourly watchdog will continue it, or run resumeAdsDfsNow()' : ''));
+  }
   console.log('Daily starters: ' + handlers.filter(function (h) { return h === ADS_DFS_STARTER; }).length +
              ' (expected ' + ADS_DFS.fullAutomationHours.length + ')');
 }
