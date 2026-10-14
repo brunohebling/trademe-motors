@@ -17,7 +17,7 @@
  *     pause is a short one when a step reaches its time limit and a new one has to start
  *   - the keyword list is copied to a hidden 'DFS run keywords' tab when a run starts, so a
  *     refresh of Final keywords mid-run doesn't change which keywords the run checks
- *   - results are written to hidden 'DFS working - <tab>' tabs and copied to the tabs Combined Data
+ *   - results are written to hidden 'DFS working - <tab>' tabs (removed once published) and copied to the tabs Combined Data
  *     reads only when a run has finished and passed its checks (every keyword has rows, at most
  *     maxErrorShare of them errors). A failed or half-finished run never leaves keywords blank:
  *     Combined Data keeps the previous complete results
@@ -896,6 +896,16 @@ function adsDfsPublish_() {
   var lock = LockService.getScriptLock();
   ['mobile', 'desktop'].forEach(function (device) {
     adsDfsReplaceSheet_(lock, ss, ADS_DFS.outputSheets[device], data[device]);
+  });
+  // The working tabs have done their job once the live tabs are updated: remove them.
+  // The next run creates them again. (A run that fails its checks keeps them, for checking.)
+  ['mobile', 'desktop'].forEach(function (device) {
+    try {
+      var work = ss.getSheetByName(adsDfsWorkName_(ADS_DFS.outputSheets[device]));
+      if (work) ss.deleteSheet(work);
+    } catch (e) {
+      console.log('Could not remove the working tab: ' + e.message);
+    }
   });
   return { published: true, reason: '', stats: stats };
 }
